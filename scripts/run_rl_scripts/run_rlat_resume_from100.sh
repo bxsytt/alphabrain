@@ -1,8 +1,16 @@
 #!/bin/bash
-# 从 iter 20 checkpoint 恢复训练，继续训练 20 个 iter（到 iter 40）
+# 从 iter 100 checkpoint 恢复训练，继续训练到 iter 300（再训练 200 轮）
+# 参数沿用原 run_rlat_singletask_v2.sh 的值
+#
+# 主要修正（对比旧版 run_rlat_resume_from20.sh）：
+#   1. max_iter=300（原为 100 → 空循环 Bug，start_iter=101 > max_iter=100）
+#   2. warmup_iters=0（resume 不需要 VLA warmup）
+#   3. bc_pretrain_steps=0（resume 不需要 BC pretrain）
+#   4. 参数对齐原 singletask_v2：success_weight=5.0, td_updates_per_iter=50000, eval_interval=10, save_interval=10
+# ============================================================
 
 RESUME_CKPT="/home/zlb/embody_project/AlphaBrain/results/action_token_training_TD3/rlt_singletask_task0_v2_0513_1354/rl_offpolicy/checkpoints/rl_offpolicy_iter_00100"
-NEW_DIR="results/action_token_training_TD3/singletask_test_0513_$(date +%m%d_%H%M)/rl_offpolicy"
+NEW_DIR="results/action_token_training_TD3/singletask_resume_v2_$(date +%m%d_%H%M)/rl_offpolicy"
 
 python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --phase rl_offpolicy \
@@ -32,9 +40,9 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --max_grad_norm 1.0 \
     --buffer_capacity 1000000 \
     --buffer_warmup 1024 \
-    --warmup_iters 20 \
-    --bc_pretrain_steps 5000 \
-    --td_updates_per_iter 10000 \
+    --warmup_iters 0 \
+    --bc_pretrain_steps 0 \
+    --td_updates_per_iter 50000 \
     --utd_ratio 10.0 \
     --td_batch_size 256 \
     --tau 0.005 \
@@ -47,9 +55,9 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --eval_interval 20 \
     --eval_n_episodes 20 \
     --save_interval 20 \
-    --save_video_interval 100 \
+    --save_video_interval 20 \
     --seed 42 \
     --use_wandb \
     --wandb_project AlphaBrain_RLT \
-    --run_name "rlt_singletask_task0_resume_from20" \
+    --run_name "rlt_singletask_task0_resume_from100_to300" \
     --log_interval 1
