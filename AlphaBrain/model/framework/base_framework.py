@@ -159,13 +159,19 @@ class BaseFramework(PreTrainedModel):
             weights_path = pretrained_checkpoint / "model.safetensors"
             if not weights_path.exists():
                 weights_path = pretrained_checkpoint / "pytorch_model.pt"
+            if not weights_path.exists():
+                weights_path = pretrained_checkpoint / "latest_model.pt"
             assert weights_path.exists(), f"[lpt0309] No weights file found in {pretrained_checkpoint}"
 
             if weights_path.suffix == ".safetensors":
                 from safetensors.torch import load_file
                 model_state_dict = load_file(str(weights_path))
             else:
-                model_state_dict = torch.load(weights_path, map_location="cpu")
+                # lpt0509: Load state_dict directly to CUDA to avoid CPU OOM (~7.6GB on CPU would
+                # exceed the ~9.9GB available RAM when combined with the model structure).
+                # GPU VRAM (24GB) has plenty of headroom for the temporary state dict.
+                _map_dev = "cuda" if torch.cuda.is_available() else "cpu"
+                model_state_dict = torch.load(weights_path, map_location=_map_dev)
 
             logger.info(f"[lpt0309] Loading weights from {weights_path}")
             

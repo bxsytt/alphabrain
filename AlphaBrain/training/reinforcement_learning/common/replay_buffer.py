@@ -26,6 +26,8 @@ class ReplayBuffer:
         self.pos = 0
         # task_id index: task_id -> list of buffer positions (for stratified sampling)
         self._task_index: dict = defaultdict(list)
+        # success flag per transition (parallel to buffer, for success-weighted sampling)
+        self._success_flag: list = []
 
     def push(
         self,
@@ -39,6 +41,7 @@ class ReplayBuffer:
         task_id: int = 0,
         prop_state: Optional[torch.Tensor] = None,       # (prop_dim,)
         next_prop_state: Optional[torch.Tensor] = None,  # (prop_dim,)
+        from_success: bool = False,    # whether this transition is from a successful episode
     ):
         """Store a single transition (all tensors detached to CPU)."""
         # Default zero prop states if not provided
@@ -62,6 +65,7 @@ class ReplayBuffer:
         if len(self.buffer) < self.capacity:
             idx = len(self.buffer)
             self.buffer.append(transition)
+            self._success_flag.append(from_success)
         else:
             idx = self.pos
             # Remove old task_id index entry for overwritten slot
@@ -75,6 +79,7 @@ class ReplayBuffer:
             except ValueError:
                 pass
             self.buffer[idx] = transition
+            self._success_flag[idx] = from_success
 
         self._task_index[task_id].append(idx)
         self.pos = (self.pos + 1) % self.capacity
@@ -83,9 +88,18 @@ class ReplayBuffer:
         self,
         batch_size: int,
         device: str = "cuda",
+        success_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Sample a random mini-batch (uniform over all transitions).
+        Sample a random mini-batch with optional success-weighted oversampling.
+
+        When success_weight > 1.0, transitions from successful episodes are
+        sampled at higher probability than failure transitions.
+
+        Args:
+            batch_size: number of transitions to sample
+            device: target device for tensors
+            success_weight: oversampling factor for successful transitions (1.0 = uniform)
 
         Returns:
             Tuple of (rl_tokens, vla_actions, actions_taken, rewards,
@@ -93,7 +107,18 @@ class ReplayBuffer:
                        prop_states, next_prop_states)
             Each tensor has batch dim prepended and is moved to `device`.
         """
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        if success_weight > 1.0 and any(self._success_flag):
+            # Success-weighted sampling: boost probability of successful transitions
+            weights = np.array(
+                [success_weight if f else 1.0 for f in self._success_flag],
+                dtype=np.float64,
+            )
+            weights /= weights.sum()
+            indices = np.random.choice(
+                len(self.buffer), batch_size, replace=False, p=weights
+            )
+        else:
+            indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         return self._collect(indices, device)
 
     def sample_balanced(
@@ -101,17 +126,19 @@ class ReplayBuffer:
         batch_size: int,
         n_tasks: int,
         device: str = "cuda",
+        success_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Per-task stratified sampling: sample equal number of transitions from each task.
+        Per-task stratified sampling with optional success-weighted oversampling.
 
-        Ensures each task contributes equally to each gradient update, matching
-        GRPO's equal-frequency multi-task update property.
+        When success_weight > 1.0, successful transitions within each task are
+        sampled at higher probability than failure transitions.
 
         Args:
             batch_size: total transitions to sample
             n_tasks: number of tasks (0..n_tasks-1)
             device: target device
+            success_weight: oversampling factor for success transitions (1.0 = uniform)
         """
         per_task = max(1, batch_size // n_tasks)
         all_indices = []
@@ -121,7 +148,17 @@ class ReplayBuffer:
             if not pool:
                 continue
             n_sample = min(per_task, len(pool))
-            chosen = np.random.choice(pool, n_sample, replace=(n_sample > len(pool)))
+
+            if success_weight > 1.0 and any(self._success_flag[i] for i in pool):
+                # Success-weighted sampling within this task
+                weights = np.array([success_weight if self._success_flag[i] else 1.0
+                                    for i in pool], dtype=np.float64)
+                weights /= weights.sum()
+                chosen = np.random.choice(pool, n_sample, replace=(n_sample > len(pool)),
+                                          p=weights)
+            else:
+                chosen = np.random.choice(pool, n_sample, replace=(n_sample > len(pool)))
+
             all_indices.extend(chosen.tolist())
 
         if not all_indices:
@@ -153,3 +190,9 @@ class ReplayBuffer:
     def task_counts(self) -> dict:
         """Return number of transitions per task (for diagnostics)."""
         return {tid: len(indices) for tid, indices in self._task_index.items()}
+
+    def success_ratio(self) -> float:
+        """Fraction of transitions from successful episodes."""
+        if not self._success_flag:
+            return 0.0
+        return sum(self._success_flag) / len(self._success_flag)

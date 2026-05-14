@@ -25,11 +25,22 @@ Paper Eq. 2 — Decoder (autoregressive reconstruction):
   preservation in the bottleneck.
 """
 
+"""
+Actor-Critic 网络定义 — 包含 ActionTokenActor（π_θ网络，输入rl_token + VLA参考动作 + 本体感知，输出动作）、
+ActionTokenCritic（V(s)值函数，PPO路径使用）、ActionTokenQCritic（Twin-Q网络，TD3路径使用）
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+"""
+含义： 论文 Eq.1 的实现。在 action queries 序列末尾添加一个可学习的 e_rl 嵌入，通过多层
+自注意力 Transformer 处理整个序列，取 e_rl 位置的输出，再通过线性投影压缩到瓶颈维度。
 
+    输入： action_queries: (B, M, H)
+    输出： rl_token: (B, 1, D_bottleneck)
+"""
 class ActionTokenEncoder(nn.Module):
     """
     Paper Eq. 1: Compress VLA action_queries (B, M, H) → rl_token (B, 1, D).
@@ -83,7 +94,15 @@ class ActionTokenEncoder(nn.Module):
         rl_token = self.bottleneck_proj(seq[:, -1:, :])       # (B, 1, D)
         return rl_token
 
+"""
+含义： 论文 Eq.2 的实现。以 RL token 为前缀，自回归地逐步重构每个 VLA token。
+训练时使用 Teacher Forcing（输入 sg(z_{1:i-1}) 预测 z_i），推理时使用位置嵌入。
 
+    输入：
+        rl_token: (B, 1, D_bottleneck)
+        target_tokens: (B, M, H)（可选，训练时提供用于 Teacher Forcing）
+    输出： reconstructed: (B, M, H) — 每个位置对应原始 VLA token 的重构
+"""
 class ActionTokenDecoder(nn.Module):
     """
     Paper Eq. 2: Autoregressive reconstruction of VLA tokens from z_rl.
@@ -164,6 +183,18 @@ class ActionTokenDecoder(nn.Module):
         return seq  # (B, M, H) — each position predicts the corresponding target
 
 
+"""
+编码器:将冻结的 VLA 模型输出的高维 action queries（B×M×H，如 2048 维）压缩 为一个紧凑的
+ RL token（B×1×D_bottleneck，如 256 维）
+
+解码器:在预训练阶段通过自回归重构（autoregressive reconstruction）从 RL token 恢复
+出原始 VLA tokens，迫使瓶颈保留足够信息
+
+输入： action_queries，形状 (B, M, H) — 冻结 VLA 模型在 action token 位置处的隐藏状态序列
+输出（forward）：
+    rl_token: (B, 1, D) — 压缩后的 RL 潜在表示
+    recon_loss: 标量 — 自回归重构的 MSE 损失
+"""
 class ActionTokenEncoderDecoder(nn.Module):
     """
     Combined Encoder-Decoder for ActionToken pretraining.

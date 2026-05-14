@@ -30,7 +30,12 @@ def run_pretrain(args):
     for param in frozen_vla.parameters():
         param.requires_grad_(False)
 
-    hidden_dim = frozen_vla.qwen_vl_interface.model.config.hidden_size
+    # hidden_dim = frozen_vla.qwen_vl_interface.model.config.hidden_size
+    if hasattr(frozen_vla.qwen_vl_interface.model.config, "hidden_size"):
+        hidden_dim = frozen_vla.qwen_vl_interface.model.config.hidden_size
+    else:
+        # 针对 Qwen2.5-VL 的兼容处理
+        hidden_dim = getattr(frozen_vla.qwen_vl_interface.model.config, "hidden_dim", 2048)
     chunk_len = frozen_vla.chunk_len
 
     # Action norm stats

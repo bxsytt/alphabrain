@@ -77,7 +77,25 @@ class Qwen_GR00T(BaseFramework):
         if wm_cfg is not None and getattr(wm_cfg, "hidden_size", None) is not None:
             self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = wm_cfg.hidden_size
         else:
-            self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
+            # self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
+            # # 兼容 Qwen2.5-VL 的多种获取方式
+            # vlm_config = self.qwen_vl_interface.model.config
+            # # 依次尝试获取：1. hidden_size (旧版) 2. embed_dim (新版) 3. llm_config.hidden_size (嵌套版)
+            # dim = getattr(vlm_config, "hidden_size", 
+            #       getattr(vlm_config, "embed_dim", 
+            #       getattr(getattr(vlm_config, "llm_config", {}), "hidden_size", 3584)))
+            wm_cfg = getattr(self.config.framework, "world_model", None)
+        if wm_cfg is not None and getattr(wm_cfg, "hidden_size", None) is not None:
+            dim = wm_cfg.hidden_size
+        else:
+            # 【关键修改】：因为你的权重是 2048 维度的，这里强制指定为 2048
+            dim = 2048 
+            logger.warning(f"[QwenGR00T] FORCING dim to 2048 to match Task_9 checkpoint!")
+
+        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = dim
+        
+        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = dim
+        logger.info(f"[QwenGR00T] Detected cross_attention_dim: {dim}")
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
 
@@ -375,6 +393,120 @@ class Qwen_GR00T(BaseFramework):
 
         return future_frames
 
+    @torch.inference_mode()
+    def get_action_queries(
+        self,
+        batch_images: List = None,
+        instructions: List[str] = None,
+    ) -> torch.Tensor:
+        """
+        专门为 RLActionToken 提取特征的方法。
+        它模拟 predict_action 的前半部分，只返回 VLM 输出的 hidden_states。
+
+        Args:
+            batch_images: List of image inputs. Each element is [primary_img, wrist_img]
+                          (numpy arrays), already processed by the caller.
+            instructions: List of instruction strings.
+
+        Returns:
+            action_queries: (B, chunk_len, H) tensor of VLM hidden states,
+                            downsampled from (B, L, H) via adaptive average pooling.
+        """
+        # batch_images 是 List[List[numpy.ndarray]]，内层为 [primary, wrist]
+        # to_pil_preserve 递归转换所有 numpy 为 PIL，保留嵌套结构 → List[List[PIL.Image]]
+        batch_images = to_pil_preserve(batch_images)
+
+        # 1. 图像缩放处理（保持与训练一致）
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        # 2. 构建输入并推断特征
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions
+        )
+        
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # last_hidden: [B, L, H] — VLM full output sequence (variable L)
+            last_hidden = qwenvl_outputs.hidden_states[-1]
+
+        # 3. 将变长序列 (B, L, H) 自适应池化到固定长度 (B, chunk_len, H)
+        #    确保与下游 ActionTokenEncoderDecoder 兼容（要求固定 M=chunk_len）
+        B, L, H = last_hidden.shape
+        target_len = self.chunk_len
+        if L == target_len:
+            return last_hidden
+        # AdaptiveAvgPool1d 输入: (B, H, L) → 输出: (B, H, target_len)
+        # 先转置为 (B, H, L)，池化后再转回 (B, target_len, H)
+        pooled = torch.nn.functional.adaptive_avg_pool1d(
+            last_hidden.permute(0, 2, 1),  # (B, H, L)
+            output_size=target_len,
+        )  # (B, H, target_len)
+        return pooled.permute(0, 2, 1).contiguous()  # (B, target_len, H)
+
+    @torch.no_grad()
+    def get_vla_action(
+        self,
+        batch_images: List = None,
+        instructions: List[str] = None,
+    ):
+        """
+        同时返回 action_queries 和 VLA 基础动作预测（冻结流匹配头）。
+
+        Args:
+            batch_images: List of image inputs. Each element is [primary_img, wrist_img]
+                          (numpy arrays), already processed by the caller.
+            instructions: List of instruction strings.
+
+        Returns:
+            action_queries: (B, chunk_len, H) tensor — 用于 RL Token encoder 压缩
+            vla_actions: (B, chunk_len, action_dim) tensor — 归一化动作轨迹
+        """
+        # ----- 与 get_action_queries 共享的 VLM 前向逻辑 -----
+        batch_images_pil = to_pil_preserve(batch_images)
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            batch_images_pil = resize_images(batch_images_pil, target_size=train_obs_image_size)
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images_pil,
+            instructions=instructions,
+        )
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = qwenvl_outputs.hidden_states[-1]  # (B, L, H)
+
+        # ----- Pooling: 变长 (B, L, H) → 固定 (B, chunk_len, H) -----
+        B, L, H = last_hidden.shape
+        target_len = self.chunk_len
+        if L == target_len:
+            action_queries = last_hidden
+        else:
+            pooled = torch.nn.functional.adaptive_avg_pool1d(
+                last_hidden.permute(0, 2, 1),
+                output_size=target_len,
+            )
+            action_queries = pooled.permute(0, 2, 1).contiguous()  # (B, target_len, H)
+
+        # ----- 流匹配头预测动作（使用完整 last_hidden，而非池化版本）-----
+        with torch.autocast("cuda", dtype=torch.float32):
+            vla_actions = self.action_model.predict_action(last_hidden, state=None)
+
+        return action_queries, vla_actions
 
 
 if __name__ == "__main__":

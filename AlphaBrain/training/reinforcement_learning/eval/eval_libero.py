@@ -69,7 +69,9 @@ def main():
     for p in frozen_vla.parameters():
         p.requires_grad_(False)
 
-    hidden_dim = frozen_vla.qwen_vl_interface.model.config.hidden_size
+    vlm_config = frozen_vla.qwen_vl_interface.model.config
+    hidden_dim = getattr(vlm_config, "hidden_size",
+                 getattr(vlm_config, "hidden_dim", 2048))
     chunk_len = frozen_vla.chunk_len
     action_dim = frozen_vla.config.framework.action_model.action_dim
     norm_stats = frozen_vla.norm_stats

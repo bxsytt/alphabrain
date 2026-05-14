@@ -8,6 +8,11 @@ def parse_args():
     p.add_argument("--ckpt_path", type=str, required=True, help="SFT checkpoint path")
     p.add_argument("--encoder_path", type=str, default=None,
                    help="Pretrained encoder checkpoint (required for --phase rl)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Checkpoint directory to resume from (e.g. "
+                        ".../checkpoints/rl_offpolicy_iter_00020). "
+                        "Loads encoder.pt, actor.pt, critic.pt and continues training. "
+                        "Replay buffer and optimizer states are NOT restored.")
     p.add_argument("--output_dir", type=str, default="results/action_token_training")
     p.add_argument("--suite", type=str, default="libero_goal",
                    choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"])
@@ -109,6 +114,13 @@ def parse_args():
                    help="Reward multiplier for success")
     p.add_argument("--fixed_std", type=float, default=0.1,
                    help="Fixed Gaussian std for actor exploration (paper: small fixed std)")
+    p.add_argument("--bc_pretrain_steps", type=int, default=0,
+                   help="Number of pure BC gradient steps after warmup, before TD3 starts. "
+                        "Pretrains actor to mimic VLA on buffer data to avoid cold-start death spiral.")
+    p.add_argument("--success_weight", type=float, default=1.0,
+                   help="Oversampling weight for successful transitions in replay buffer sampling. "
+                        "1.0 = uniform. 2.0 = 2x sampling probability for success transitions. "
+                        "Helps mitigate class imbalance in early training.")
     # Full VLA fine-tune (off-policy TD3 + VLA gradient via re-encoding)
     p.add_argument("--finetune_vla", action="store_true", default=False,
                    help="Unfreeze VLA and periodically update via re-encoding from images")

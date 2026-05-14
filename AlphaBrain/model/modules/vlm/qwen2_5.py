@@ -118,7 +118,7 @@ class _QWen_VL_Interface(nn.Module):
         else:
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_id,
-                attn_implementation=attn_impl,
+                attn_implementation="sdpa",
                 torch_dtype="auto",
             )
         # lpt0309: processor始终从model_id加载（config+tokenizer+image_processor）
@@ -128,6 +128,9 @@ class _QWen_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+
+        # align qwen2.5-vl with qwen3: expose hidden_size at top level for downstream consumers
+        self.model.config.hidden_size = self.model.config.text_config.hidden_size
 
         self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
         self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX

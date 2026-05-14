@@ -1,7 +1,24 @@
 #!/bin/bash
-# Eval an RLActionToken run: 10 libero_goal tasks split across 3 GPUs, then
-# aggregated into <RUN_DIR>/eval_<ITER>/summary.json.
-# Edit VLA_CKPT / RUN_DIR / ITER / GPU_IDS below, or override via argv.
+# Eval an RLActionToken run on libero_goal task(s). Supports both single-task
+# and multi-task evaluation. Results are aggregated into
+# <RUN_DIR>/eval_<ITER>/summary.json.
+#
+# Usage:
+#   bash scripts/run_rl_scripts/run_eval_action_token.sh [RUN_DIR] [GPU_IDS] [TASK_IDS]
+#
+# Examples:
+#   # Single-task eval (default: task 0 on GPU 0)
+#   bash scripts/run_rl_scripts/run_eval_action_token.sh
+#
+#   # Single-task eval with explicit args
+#   bash scripts/run_rl_scripts/run_eval_action_token.sh \
+#       results/my_run/rl_offpolicy 0 0
+#
+#   # Multi-task eval (tasks 0,1,2 on GPU 0, tasks 3,4 on GPU 1)
+#   TASK_IDS="0,1,2,3,4" GPU_IDS="0,1" \
+#       bash scripts/run_rl_scripts/run_eval_action_token.sh
+#
+# Edit VLA_CKPT / RUN_DIR / ITER / GPU_IDS / TASK_IDS below, or override via argv.
 set -euo pipefail
 cd "${ALPHABRAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"  # e.g. /path/to/AlphaBrain
 
@@ -18,29 +35,46 @@ export TOKENIZERS_PARALLELISM=false
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 # ── Edit these before running ────────────────────────────────
-VLA_CKPT="results/training/QwenOFT-5traj-libero_goal/final_model"
-RUN_DIR=${1:-"results/rlt_training_TD3/rlt_5traj_alltasks_v3_release_0414_1727/rl_offpolicy"}
+VLA_CKPT="data/final_run"
+RUN_DIR=${1:-"results/action_token_training_TD3/rlt_singletask_task0_v2_0513_1354/rl_offpolicy"}
 
-ITER="iter_00400"
-GPU_IDS=${2:-"0,1,2"}
+ITER="iter_00100"
+GPU_IDS=${2:-"1"}          # Use GPU 1 (GPU 0 may have lingering processes)
+TASK_IDS=${3:-"0"}         # comma-separated list; default: only task 0 (single-task)
+SAVE_EVAL_VIDEOS=${SAVE_EVAL_VIDEOS:-true}   # set to false to skip video saving
 # ─────────────────────────────────────────────────────────────
 
 ACTION_TOKEN_CKPT="${RUN_DIR}/checkpoints/rl_offpolicy_${ITER}"
 OUT_DIR="${RUN_DIR}/eval_${ITER}"
-IFS=',' read -r GPU_A GPU_B GPU_C <<< "${GPU_IDS}"
 mkdir -p "${OUT_DIR}"
 
 # Remove stale shard JSONs from prior runs so aggregate never silently reads
 # pre-refactor results if the fresh eval fails.
 rm -f "${OUT_DIR}"/shard_*.json "${OUT_DIR}"/summary.json
 
-# Round-robin split of 10 libero_goal tasks across 3 GPUs:
-TASKS_A="0,1,2,3"   # 4 tasks
-TASKS_B="4,5,6"     # 3 tasks
-TASKS_C="7,8,9"     # 3 tasks
+# Parse task IDs into an array, then split across GPUs round-robin.
+IFS=',' read -r -a TASK_ARRAY <<< "${TASK_IDS}"
+N_TASKS=${#TASK_ARRAY[@]}
+
+IFS=',' read -r -a GPU_ARRAY <<< "${GPU_IDS}"
+N_GPUS=${#GPU_ARRAY[@]}
+
+# Build comma-separated task groups per GPU (round-robin distribution).
+declare -a GPU_TASK_GROUPS
+for g in $(seq 0 $((N_GPUS - 1))); do
+    GPU_TASK_GROUPS[g]=""
+done
+for i in "${!TASK_ARRAY[@]}"; do
+    g=$(( i % N_GPUS ))
+    if [ -z "${GPU_TASK_GROUPS[g]}" ]; then
+        GPU_TASK_GROUPS[g]="${TASK_ARRAY[i]}"
+    else
+        GPU_TASK_GROUPS[g]="${GPU_TASK_GROUPS[g]},${TASK_ARRAY[i]}"
+    fi
+done
 
 N_EPS=50
-NUM_WORKERS=4
+NUM_WORKERS=2             # fewer workers = lower peak GPU memory
 SUITE=libero_goal
 ARCH_ARGS="--bottleneck_dim 256 --encoder_layers 2 --encoder_heads 4 --actor_hidden_dim 512 --ref_dropout 0.5 --fixed_std 0.1 --prop_dim 8"
 
@@ -58,9 +92,11 @@ echo " Eval RLActionToken (${ITER}) | ${N_EPS} eps/task, ${NUM_WORKERS} workers/
 echo "   ckpt: ${ACTION_TOKEN_CKPT}"
 echo "   vla:  ${VLA_CKPT}"
 echo "   out:  ${OUT_DIR}"
-echo "   GPU ${GPU_A}: tasks [${TASKS_A}]"
-echo "   GPU ${GPU_B}: tasks [${TASKS_B}]"
-echo "   GPU ${GPU_C}: tasks [${TASKS_C}]"
+for g in $(seq 0 $((N_GPUS - 1))); do
+    tasks="${GPU_TASK_GROUPS[g]}"
+    [ -z "$tasks" ] && continue
+    echo "   GPU ${GPU_ARRAY[g]}: tasks [${tasks}]"
+done
 echo "============================================================"
 
 # Cleanup on any exit (Ctrl-C, error, normal). Registered BEFORE launching
@@ -82,35 +118,53 @@ _cleanup () {
 }
 trap _cleanup EXIT INT TERM
 
-run_shard () {
-    local gpu=$1 tasks=$2 tag=$3
-    local out="${OUT_DIR}/shard_${tag}.json"
+# ── run_shard: launch one eval_libero.py process in the background ──
+run_shard() {
+    local gpu_id="$1"
+    local tasks="$2"
+    local tag="$3"
     local log="${OUT_DIR}/shard_${tag}.log"
-    # setsid → fresh session/process group. Lets _cleanup take down the whole
-    # subtree (python + its libero_env_worker children) via `kill -- -PGID`.
-    CUDA_VISIBLE_DEVICES=${gpu} setsid python AlphaBrain/training/reinforcement_learning/eval/eval_libero.py \
-        --vla_ckpt "${VLA_CKPT}" \
+    local results_json="${OUT_DIR}/shard_${tag}.json"
+
+    local video_args=""
+    if [ "${SAVE_EVAL_VIDEOS}" = "true" ]; then
+        video_args="--video_dir ${OUT_DIR}/videos"
+    fi
+
+    CUDA_VISIBLE_DEVICES="${gpu_id}" python AlphaBrain/training/reinforcement_learning/eval/eval_libero.py \
         --action_token_ckpt "${ACTION_TOKEN_CKPT}" \
-        --suite ${SUITE} \
-        --n_eps_per_task ${N_EPS} \
-        --gpu 0 \
-        --task_ids "${tasks}" \
-        --results_json "${out}" \
-        --num_workers ${NUM_WORKERS} \
+        --vla_ckpt          "${VLA_CKPT}" \
+        --suite             "${SUITE}" \
+        --n_eps_per_task    "${N_EPS}" \
+        --gpu               0 \
+        --task_ids          "${tasks}" \
+        --num_workers       "${NUM_WORKERS}" \
+        --results_json      "${results_json}" \
+        ${video_args} \
         ${ARCH_ARGS} \
         > "${log}" 2>&1 &
+
     local pid=$!
-    eval "PID_${tag}=${pid}"
-    SHARD_PIDS+=(${pid})
+    # Declare globally so the wait loop below can read PID_<tag>.
+    declare -g "PID_${tag}=${pid}"
+    SHARD_PIDS+=("${pid}")
+    echo "[shard ${tag}] launched PID ${pid} — log: ${log}"
 }
 
-run_shard "${GPU_A}" "${TASKS_A}" "a"
-run_shard "${GPU_B}" "${TASKS_B}" "b"
-run_shard "${GPU_C}" "${TASKS_C}" "c"
+SHARD_TAGS=()
+for g in $(seq 0 $((N_GPUS - 1))); do
+    tasks="${GPU_TASK_GROUPS[g]}"
+    [ -z "$tasks" ] && continue
+    gpu_id="${GPU_ARRAY[g]}"
+    # Map gpu index → letter tag (a, b, c, ...)
+    tag=$(echo "abcdefghijklmnopqrstuvwxyz" | cut -c$((g + 1)))
+    SHARD_TAGS+=("$tag")
+    run_shard "${gpu_id}" "${tasks}" "${tag}"
+done
 
 # Mirror each shard log to main stdout with a `[tag] ` prefix so progress is
 # visible live. Tails are killed by _cleanup on any exit.
-for tag in a b c; do
+for tag in "${SHARD_TAGS[@]}"; do
     _log="${OUT_DIR}/shard_${tag}.log"
     : > "${_log}"   # create empty file so tail -F starts following immediately
     (tail -F -q -n +1 "${_log}" 2>/dev/null | sed -u "s/^/[${tag}] /") &
@@ -120,7 +174,7 @@ done
 # Wait on each PID individually and abort if any shard failed — unlike
 # bare `wait`, this propagates non-zero exit codes from background children.
 fail=0
-for tag in a b c; do
+for tag in "${SHARD_TAGS[@]}"; do
     pid_var="PID_${tag}"
     pid=${!pid_var}
     if ! wait "${pid}"; then

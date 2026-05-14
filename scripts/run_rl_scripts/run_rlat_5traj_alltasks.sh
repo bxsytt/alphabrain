@@ -12,11 +12,11 @@ export LIBERO_HOME="${LIBERO_HOME:-/path/to/LIBERO}"
 export TOKENIZERS_PARALLELISM=false
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
-GPU_IDS=${1:-"0,2,3,4,5,1"}
+GPU_IDS=${1:-"0,1"}
 PRETRAIN_GPU="${GPU_IDS%%,*}"   # first GPU in the list
 
-CKPT_PATH="results/training/QwenOFT-5traj-libero_goal/final_model"
-PRETRAIN_DIR="results/rlt_training_TD3/5traj_alltasks_pretrain/pretrain"
+CKPT_PATH="/home/zlb/embody_project/AlphaBrain/data/final_run"
+PRETRAIN_DIR="/home/zlb/embody_project/AlphaBrain/results/rlt_training_TD3/5traj_alltasks_pretrain/pretrain"
 ENCODER_PATH="${PRETRAIN_DIR}/checkpoints/pretrain_best/encoder.pt"
 
 RUN_NAME="rlt_5traj_alltasks_release"
@@ -49,8 +49,8 @@ if [ ! -f "${ENCODER_PATH}" ]; then
         --pretrain_epochs 500 \
         --pretrain_lr 1e-4 \
         --pretrain_batch_size 32 \
-        --vla_extract_batch_size 16 \
-        --num_envs_per_task 8 \
+        --vla_extract_batch_size 4 \
+        --num_envs_per_task 2 \
         --seed 42 \
         --use_wandb \
         --wandb_project AlphaBrain_RLT \
@@ -73,18 +73,18 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --suite libero_goal \
     --all_tasks \
     --use_steplock \
-    --rollout_gpus 0,1,2,3,4 \
-    --train_gpu 5 \
+    --rollout_gpus 0 \
+    --train_gpu 1 \
     --bottleneck_dim 256 \
     --encoder_layers 2 \
     --encoder_heads 4 \
     --actor_hidden_dim 512 \
     --critic_hidden_dim 512 \
     --ref_dropout 0.5 \
-    --fixed_std 0.1 \
-    --G_per_task 30 \
+    --fixed_std 0.3 \
+    --G_per_task 60 \
     --group_size 1 \
-    --num_envs_per_task 10 \
+    --num_envs_per_task 1 \
     --reward_coef 5.0 \
     --lr_actor 3e-4 \
     --lr_critic 3e-4 \
@@ -92,12 +92,14 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --max_grad_norm 1.0 \
     --buffer_capacity 1000000 \
     --buffer_warmup 1024 \
-    --warmup_iters 5 \
+    --warmup_iters 30 \
+    --bc_pretrain_steps 2000 \
     --td_updates_per_iter 10000 \
-    --utd_ratio 10.0 \
-    --td_batch_size 1024 \
+    --utd_ratio 3.0 \
+    --td_batch_size 256 \
     --tau 0.005 \
-    --beta 1.0 \
+    --beta 0.2 \
+    --success_weight 2.0 \
     --actor_update_freq 2 \
     --target_noise_std 0.2 \
     --target_noise_clip 0.5 \

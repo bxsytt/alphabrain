@@ -75,7 +75,28 @@ class Qwenvl_OFT(BaseFramework):
         self.config = config
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         # align dims --> we should put them to config or no?
-        config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
+        # config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
+
+        vlm_config = self.qwen_vl_interface.model.config
+
+        # 1. 尝试获取维度，兼容不同版本的 Qwen/Llama
+        # Qwen2.5-VL 使用 embed_dim, 其他模型多用 hidden_size
+        dim = getattr(vlm_config, "embed_dim", getattr(vlm_config, "hidden_size", None))
+
+        # 2. 如果依然获取不到（极端情况），从模型权重或配置中兜底
+        if dim is None:
+            # 也可以尝试从 word_embeddings 或其他层获取
+            if hasattr(self.qwen_vl_interface.model, "get_input_embeddings"):
+                dim = self.qwen_vl_interface.model.get_input_embeddings().embedding_dim
+            else:
+                # 如果还是不行，根据报错信息，您的模型实际维度是 2048
+                dim = 2048 
+                logger.warning(f"[Warning] Could not find dim in config, falling back to 2048")
+
+        # 3. 将正确的维度赋值给 action_model 配置
+        self.config.framework.action_model.action_hidden_dim = dim
+        logger.info(f"[Init] Detected VLM hidden dimension: {dim}")
+
         self.action_model = get_action_model(config=self.config)
 
         self.future_action_window_size = config.framework.action_model.future_action_window_size
@@ -254,6 +275,14 @@ class Qwenvl_OFT(BaseFramework):
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )
+
+        # ── 显存优化：显式释放中间隐状态（36层全部释放） ──
+        # qwenvl_outputs.hidden_states 包含所有Transformer层的输出，
+        # 每层 ~8MB (batch=2, L~1000, H=2048, bf16)，36层共 ~290MB
+        del last_hidden
+        del qwenvl_outputs
+        del qwen_inputs  # 显存优化：释放pixel_values等大张量
+
         return action_queries  # (B, chunk_len, H)
 
     @torch.no_grad()
@@ -272,6 +301,7 @@ class Qwenvl_OFT(BaseFramework):
         action_queries = self.get_action_queries(batch_images, instructions)
         with torch.autocast("cuda", dtype=torch.float32):
             vla_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+        # 注意: action_queries 在返回后由调用者负责删除
         return action_queries, vla_actions
 
     def _gather_action_token_embeddings(

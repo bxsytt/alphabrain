@@ -12,6 +12,12 @@ No BatchInferenceServer needed. No async queuing. No batch fragmentation.
 Speedup: ~50x vs original (env creation + batch fragmentation eliminated).
 """
 
+"""
+训练逻辑 — 包含 action_token_ppo_loss（PPO loss计算）、action_token_collect_group（episode收集）、push_episodes_to_buffer（回放缓冲区写入）、
+action_token_td_critic_update 和 action_token_td_actor_update（TD3更新）
+"""
+
+import gc
 import logging
 import os
 import time
@@ -144,6 +150,11 @@ def action_token_collect_group_steplock(
     _t_total_chunks = 0
     _t_rollout_start = time.time()
 
+    # ── 显存监控：每次collect开始时打印显存状态 ──
+    _mem_alloc_start = torch.cuda.memory_allocated(device) / 1024**3
+    _mem_reserved_start = torch.cuda.memory_reserved(device) / 1024**3
+    print(f"  [GPU MEM @ start] allocated={_mem_alloc_start:.2f}GB  reserved={_mem_reserved_start:.2f}GB", flush=True)
+
     for chunk_idx in range(max_chunks):
         active_ids = [g for g in range(G) if active[g]]
         if not active_ids:
@@ -169,6 +180,8 @@ def action_token_collect_group_steplock(
         # ── Step 2: Batch encoder + actor ──
         _t0 = time.time()
         rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)
+        # 显存优化：action_queries 使用完毕后立即删除（释放QwenVL中间隐状态的最后一个引用）
+        del action_queries
 
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
@@ -211,6 +224,15 @@ def action_token_collect_group_steplock(
         _t1 = time.time()
         _t_store_records += _t1 - _t0
 
+        # 显存优化：GPU张量已拷贝到CPU，删除GPU版本释放显存
+        del vla_actions_for_actor
+        del vla_actions  # 显存优化：显式删除原始vla_actions引用
+        del rl_tokens
+        del actions_t
+        if not warmup_mode:
+            del log_probs
+            del values
+        
         # ── Step 3: Unnormalize actions ──
         _t0 = time.time()
         action_chunks_unnorm = []
@@ -255,6 +277,29 @@ def action_token_collect_group_steplock(
             f"env_step={_t_env_step/_t_total_chunks:.3f}s  "
             f"chunk_total={time.time()-_t_chunk_start:.3f}s"
         )
+
+        # ── 显存优化：每5个chunk清理一次PyTorch缓存分配器 ──
+        # QwenVL forward (output_hidden_states=True) 每次产生 ~290MB 中间隐状态。
+        # PyTorch的缓存分配器不会自动归还显存，定期清理可避免碎片化累积导致OOM。
+        if chunk_idx > 0 and chunk_idx % 5 == 0:
+            _mem_before = torch.cuda.memory_allocated(device) / 1024**3
+            gc.collect()
+            torch.cuda.empty_cache()
+            _mem_after = torch.cuda.memory_allocated(device) / 1024**3
+            _freed = _mem_before - _mem_after
+            if _freed > 0.1:  # 只打印释放超过100MB的情况
+                print(f"  [GPU MEM] chunk {chunk_idx}: freed {_freed:.2f}GB "
+                      f"(allocated: {_mem_before:.2f}GB → {_mem_after:.2f}GB)", flush=True)
+
+    # ── 显存优化：collect结束后强制清理GPU缓存 ──
+    # 避免跨collect的碎片化累积导致下一个collect开始时显存不足
+    gc.collect()
+    torch.cuda.empty_cache()
+    _mem_alloc_end = torch.cuda.memory_allocated(device) / 1024**3
+    _mem_reserved_end = torch.cuda.memory_reserved(device) / 1024**3
+    _mem_delta = _mem_alloc_end - _mem_alloc_start
+    print(f"  [GPU MEM @ end] allocated={_mem_alloc_end:.2f}GB  reserved={_mem_reserved_end:.2f}GB  "
+          f"delta={_mem_delta:+.2f}GB", flush=True)
 
     # ── Timing summary ──
     _t_rollout_total = time.time() - _t_rollout_start
@@ -393,6 +438,9 @@ def action_token_collect_multitask_steplock(
                 batch_images=batch_images, instructions=batch_instrs)
 
         rl_tokens = encoder.encode(action_queries)
+        # 显存优化：action_queries 使用完毕后立即删除（释放QwenVL中间隐状态的最后一个引用）
+        del action_queries
+
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         if actor_chunk_len < vla_actions.size(1):
@@ -423,6 +471,15 @@ def action_token_collect_multitask_steplock(
                 prop_state=torch.tensor(batch_props[i]),
             ))
 
+        # 显存优化：GPU张量已拷贝到CPU，删除GPU版本释放显存
+        del vla_actions_for_actor
+        del vla_actions  # 显存优化：显式删除原始vla_actions引用
+        del rl_tokens
+        del actions_t
+        if not warmup_mode:
+            del log_probs
+            del values
+
         # Unnormalize
         action_chunks_unnorm = [_unnormalize(actions_np[i], action_norm_stats) for i in range(len(active_ids))]
 
@@ -448,6 +505,23 @@ def action_token_collect_multitask_steplock(
                     ep.env_steps = env_steps[g]
         _t_env += time.time() - _t0
         _n_chunks += 1
+
+        # ── 显存优化：每5个chunk清理一次PyTorch缓存分配器 ──
+        # QwenVL forward (output_hidden_states=True) 每次产生 ~290MB 中间隐状态。
+        # PyTorch的缓存分配器不会自动归还显存，定期清理可避免碎片化累积导致OOM。
+        if chunk_idx > 0 and chunk_idx % 5 == 0:
+            _mem_before = torch.cuda.memory_allocated(device) / 1024**3
+            gc.collect()
+            torch.cuda.empty_cache()
+            _mem_after = torch.cuda.memory_allocated(device) / 1024**3
+            _freed = _mem_before - _mem_after
+            if _freed > 0.1:  # 只打印释放超过100MB的情况
+                print(f"  [GPU MEM] chunk {chunk_idx}: freed {_freed:.2f}GB "
+                      f"(allocated: {_mem_before:.2f}GB → {_mem_after:.2f}GB)", flush=True)
+
+    # ── 显存优化：collect结束后强制清理GPU缓存 ──
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Finalize
     for g in range(total_G):

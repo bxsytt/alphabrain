@@ -12,12 +12,30 @@ Key design choices from the paper:
   - Critic (Eq. 3): Q(s, a) — twin Q-networks (TD3-style).
 """
 
+"""
+信息瓶颈核心 — 包含 ActionTokenEncoder（将 VLA 的 action queries 压缩为 rl_token）和 ActionTokenDecoder（自回归重构 VLA tokens，仅预训练使用）
+"""
+
 import copy
 
 import torch
 import torch.nn as nn
 
+"""
+含义： 论文 Eq.4-5 的 Actor 网络 π_θ(a|x, ã)。它直接输出完整的动作序列 chunk，输入
+是 RL token、VLA 参考动作和本体感知状态。VLA 参考动作不是残差连接，而是一个条件输入；
+通过损失中的 BC 正则化项 β‖a−ã‖² 使输出接近 VLA 参考。参考动作 Dropout（默认 50%）防止策略退化为恒等映射。
 
+    输入：
+        rl_token: (B, 1, D) 或 (B, D) — 压缩后的 RL 潜在表示
+        vla_action: (B, chunk_len, action_dim) — VLA 模型的参考动作
+        prop_state: (B, prop_dim)（可选）— 本体感知状态（论文中为 eef_pos(3) + axisangle(3) + gripper(2)=8 维）
+        deterministic: bool — 是否确定性输出
+    输出：
+        action: (B, chunk_len, action_dim) — 采样的动作序列
+        log_prob: (B,) — 每个样本动作的对数概率（确定性模式为 None）
+关键设计： 固定标准差 fixed_std=0.1，输出为高斯分布 N(μ, σ²I)
+"""
 class ActionTokenActor(nn.Module):
     """
     ActionToken actor from paper (Eq. 4-5).
@@ -154,7 +172,20 @@ def soft_update_target(source: nn.Module, target: nn.Module, tau: float = 0.005)
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.mul_(1.0 - tau).add_(sp.data, alpha=tau)
 
+"""
+含义： 论文 Eq.3 的 Twin-Q Critic（TD3 风格）。它评估状态-动作对的 Q 值。
+Q 网络以 (rl_token, action_chunk, prop_state) 为输入，输出标量 Q 值。包含两个独立
+的 Q 网络（q1、q2），目标 Q 值取二者最小值以防止 Q 值高估（overestimation bias）。
 
+    输入：
+        rl_token: (B, 1, D) 或 (B, D) — RL 潜在表示
+        action: (B, chunk_len, action_dim) — 动作序列
+        prop_state: (B, prop_dim)（可选）— 本体感知状态
+    输出：
+        q1: (B,) — 第一个 Q 网络的输出
+        q2: (B,) — 第二个 Q 网络的输出
+    额外方法： q1_forward() 仅计算 Q1，用于 Actor 的更新以减少计算量。
+"""
 class ActionTokenQCritic(nn.Module):
     """
     Twin Q-critic from RL Token paper (Eq. 3, following TD3).
@@ -239,7 +270,12 @@ class ActionTokenQCritic(nn.Module):
 
 
 # ── Keep old V(s) critic for backward compatibility with PPO path ──
-
+"""
+含义： 传统的状态值函数 V(s)（Legacy 实现，仅用于 PPO 路径）。它以 RL token 为输入，
+直接估计当前状态的标量价值。与 QCritic 不同，它不依赖动作，只评估状态本身。
+    输入： rl_token: (B, 1, D) 或 (B, D)
+    输出： value: (B,) — 每个样本的状态值估计
+"""
 class ActionTokenCritic(nn.Module):
     """State value estimator V(s) from rl_token. (Legacy, for PPO path only.)"""
 

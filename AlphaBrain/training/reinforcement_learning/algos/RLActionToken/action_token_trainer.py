@@ -908,6 +908,7 @@ def push_episodes_to_buffer(
                     task_id=ep.task_id,
                     prop_state=prop,
                     next_prop_state=next_prop,
+                    from_success=(ep.reward > 0.5),
                 )
                 n_pushed += 1
     return n_pushed
@@ -1019,6 +1020,7 @@ def action_token_td_critic_update(
     target_noise_clip: float = 0.5,
     n_tasks: int = 0,
     target_actor: ActionTokenActor = None,
+    success_weight: float = 1.0,
 ):
     """
     TD3-style twin-Q critic update from replay buffer (Eq. 3 in paper).
@@ -1030,6 +1032,7 @@ def action_token_td_critic_update(
         n_tasks: if > 0, use per-task stratified sampling for balanced multi-task update.
         target_actor: Polyak-averaged actor for computing next actions (TD3).
                       Falls back to online actor if None.
+        success_weight: oversampling factor for successful transitions (>1.0 enables weighting).
 
     Returns:
         critic_loss: scalar tensor (with grad on q_critic params)
@@ -1037,10 +1040,11 @@ def action_token_td_critic_update(
     """
     if n_tasks > 0:
         rl_tok, vla_act, act_taken, rew, next_rl_tok, next_vla_act, done, prop, next_prop = \
-            replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device)
+            replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device,
+                                          success_weight=success_weight)
     else:
         rl_tok, vla_act, act_taken, rew, next_rl_tok, next_vla_act, done, prop, next_prop = \
-            replay_buffer.sample(batch_size, device=device)
+            replay_buffer.sample(batch_size, device=device, success_weight=success_weight)
 
     # ── Target Q value (TD3: target policy smoothing + min of twin Q) ──
     with torch.no_grad():
@@ -1084,6 +1088,7 @@ def action_token_td_actor_update(
     beta: float = 1.0,
     device: str = "cuda",
     n_tasks: int = 0,
+    success_weight: float = 1.0,
 ):
     """
     DDPG-style actor update from the RL Token paper (Eq. 5):
@@ -1096,6 +1101,7 @@ def action_token_td_actor_update(
 
     Args:
         n_tasks: if > 0, use per-task stratified sampling for balanced multi-task update.
+        success_weight: oversampling factor for successful transitions (>1.0 enables weighting).
 
     Returns:
         actor_loss: scalar tensor (with grad on actor params)
@@ -1103,10 +1109,11 @@ def action_token_td_actor_update(
     """
     if n_tasks > 0:
         rl_tok, vla_act, _, _, _, _, _, prop, _ = \
-            replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device)
+            replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device,
+                                          success_weight=success_weight)
     else:
         rl_tok, vla_act, _, _, _, _, _, prop, _ = \
-            replay_buffer.sample(batch_size, device=device)
+            replay_buffer.sample(batch_size, device=device, success_weight=success_weight)
 
     # Paper Eq. 5: a ~ π_θ (stochastic rsample for correct gradient)
     action, _ = actor(rl_tok, vla_act, prop, deterministic=False)

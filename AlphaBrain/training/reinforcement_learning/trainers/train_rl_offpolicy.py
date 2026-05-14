@@ -7,6 +7,7 @@ Architecture (single process, no Accelerate):
   - Eval:         distributed across rollout GPUs for speed
 """
 import copy
+import gc
 import json
 import logging
 import os
@@ -94,7 +95,9 @@ def run_rl_offpolicy(args):
 
     # Get model config from any VLA copy
     ref_vla = vla_copies[rollout_gpu_ids[0]]
-    hidden_dim = ref_vla.qwen_vl_interface.model.config.hidden_size
+    vlm_config = ref_vla.qwen_vl_interface.model.config
+    hidden_dim = getattr(vlm_config, "hidden_size",
+                 getattr(vlm_config, "hidden_dim", 2048))
     chunk_len = ref_vla.chunk_len
     action_dim = ref_vla.config.framework.action_model.action_dim
     _norm_stats = ref_vla.norm_stats
@@ -184,6 +187,57 @@ def run_rl_offpolicy(args):
         bottleneck_dim=args.bottleneck_dim,
         hidden_dim=64,  # tiny, just for rollout value logging
     ).to(train_device)
+
+    # ── Checkpoint resume: load saved weights ──────────────────
+    start_iter = 1  # default: start from scratch
+    if args.resume is not None:
+        resume_dir = Path(args.resume)
+        if not resume_dir.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_dir}")
+
+        logger.info(f"=== Resuming from checkpoint: {resume_dir} ===")
+
+        # Parse iteration from directory name, e.g. rl_offpolicy_iter_00020
+        import re
+        m = re.search(r'_iter_(\d+)', resume_dir.name)
+        if m:
+            start_iter = int(m.group(1)) + 1  # resume from NEXT iteration
+            logger.info(f"  Detected resumed iteration: {m.group(1)} → starting at iter {start_iter}")
+        else:
+            logger.warning("  Could not parse iteration from checkpoint dir name; starting at iter 1")
+
+        # Load encoder weights
+        enc_path = resume_dir / "encoder.pt"
+        if enc_path.exists():
+            enc_dec.load_state_dict(torch.load(enc_path, map_location=train_device, weights_only=True))
+            logger.info(f"  Loaded encoder from {enc_path}")
+        else:
+            logger.warning(f"  encoder.pt not found at {enc_path} — keeping freshly initialized encoder")
+
+        # Load actor weights
+        actor_path = resume_dir / "actor.pt"
+        if actor_path.exists():
+            actor.load_state_dict(torch.load(actor_path, map_location=train_device, weights_only=True))
+            logger.info(f"  Loaded actor from {actor_path}")
+        else:
+            logger.warning(f"  actor.pt not found at {actor_path} — keeping freshly initialized actor")
+
+        # Load critic (Q) weights
+        critic_path = resume_dir / "critic.pt"
+        if critic_path.exists():
+            q_critic.load_state_dict(torch.load(critic_path, map_location=train_device, weights_only=True))
+            logger.info(f"  Loaded Q-critic from {critic_path}")
+        else:
+            logger.warning(f"  critic.pt not found at {critic_path} — keeping freshly initialized critic")
+
+        # Hard-sync target networks to loaded weights
+        soft_update_target(q_critic, target_q_critic, tau=1.0)
+        soft_update_target(actor, target_actor, tau=1.0)
+        logger.info("  Target networks hard-synced to loaded weights (tau=1.0)")
+
+        # Replay buffer is NOT restored — starts empty
+        logger.info("  Replay buffer starts empty (not saved in checkpoint)")
+        logger.info(f"  Warmup skipped (already complete); starting TD3 updates immediately")
 
     # ── Rollout module copies (one per rollout GPU, tiny ~9M) ──
     rollout_modules = {}
@@ -329,20 +383,52 @@ def run_rl_offpolicy(args):
     _weight_sync_lock = threading.Lock()  # protects weight copy (non-blocking)
 
     def _sync_rollout_weights():
-        """Copy latest actor/encoder weights to all rollout GPU copies (non-blocking)."""
+        """Copy latest actor/encoder weights to all rollout GPU copies (in-place, no temp GPU tensors).
+
+        Optimization: uses non_blocking=True + separate streams per-GPU to avoid serializing
+        CPU→GPU transfers. Also avoids load_state_dict(assign=True) which temporarily puts
+        params on CPU and requires a second .to(dev) copy.
+        """
         with _weight_sync_lock:
-            enc_state_cpu = {k: v.cpu() for k, v in enc_dec.state_dict().items()}
-            actor_state_cpu = {k: v.cpu() for k, v in actor.state_dict().items()}
-            dummy_critic_state_cpu = {k: v.cpu() for k, v in dummy_critic.state_dict().items()}
+            # Copy train-side state dicts to CPU once (shared across all rollout GPUs)
+            enc_sd = enc_dec.state_dict()
+            actor_sd = actor.state_dict()
+            dummy_sd = dummy_critic.state_dict()
+            # Pre-create CPU copies to avoid per-GPU serialization
+            enc_cpu = {k: v.cpu() for k, v in enc_sd.items()}
+            actor_cpu = {k: v.cpu() for k, v in actor_sd.items()}
+            dummy_cpu = {k: v.cpu() for k, v in dummy_sd.items()}
             for gpu_id in rollout_gpu_ids:
                 r_enc, r_actor, r_critic = rollout_modules[gpu_id]
                 dev = f"cuda:{gpu_id}"
-                r_enc.load_state_dict({k: v.to(dev) for k, v in enc_state_cpu.items()})
-                r_actor.load_state_dict({k: v.to(dev) for k, v in actor_state_cpu.items()})
-                r_critic.load_state_dict({k: v.to(dev) for k, v in dummy_critic_state_cpu.items()})
-        return enc_state_cpu, actor_state_cpu
+                # Direct parameter copy: avoids load_state_dict(assign=True) + .to(dev) thrash
+                # where params first get CPU data (from assign=True) then get copied back to GPU.
+                # Instead, copy CPU→GPU in one step with non_blocking.
+                with torch.cuda.device(dev):
+                    for name, param in r_enc.named_parameters():
+                        param.data.copy_(enc_cpu[name], non_blocking=True)
+                    for name, param in r_actor.named_parameters():
+                        param.data.copy_(actor_cpu[name], non_blocking=True)
+                    for name, param in r_critic.named_parameters():
+                        param.data.copy_(dummy_cpu[name], non_blocking=True)
+                    for name, buf in r_enc.named_buffers():
+                        if name in enc_cpu:
+                            buf.data.copy_(enc_cpu[name], non_blocking=True)
+                    for name, buf in r_actor.named_buffers():
+                        if name in actor_cpu:
+                            buf.data.copy_(actor_cpu[name], non_blocking=True)
+                    for name, buf in r_critic.named_buffers():
+                        if name in dummy_cpu:
+                            buf.data.copy_(dummy_cpu[name], non_blocking=True)
+        # Sync all pending CUDA copies
+        for gpu_id in rollout_gpu_ids:
+            torch.cuda.synchronize(f"cuda:{gpu_id}")
+        return enc_cpu, actor_cpu
 
-    _steplock_warmup = [True]  # shared flag: rollout thread reads, main thread sets False
+    # If resuming, we're past warmup — disable steplock warmup mode immediately
+    _steplock_warmup = [args.resume is None]  # shared flag: rollout thread reads, main thread sets False
+    if args.resume is not None and args.use_steplock:
+        logger.info("  Step-lock warmup disabled (resume mode)")
     _rollout_go = threading.Event()  # clear = paused, set = running
     _rollout_go.set()  # start unpaused
 
@@ -354,15 +440,30 @@ def run_rl_offpolicy(args):
     _eval_lock = threading.Lock()  # ensures only one eval at a time
 
     def _sync_eval_weights():
-        """Copy latest train weights to eval modules (fast, ~10ms)."""
+        """Copy latest train weights to eval modules (in-place, no temp GPU tensors)."""
         with _weight_sync_lock:
-            enc_state_cpu = {k: v.cpu() for k, v in enc_dec.state_dict().items()}
-            actor_state_cpu = {k: v.cpu() for k, v in actor.state_dict().items()}
+            enc_sd = enc_dec.state_dict()
+            actor_sd = actor.state_dict()
+            enc_cpu = {k: v.cpu() for k, v in enc_sd.items()}
+            actor_cpu = {k: v.cpu() for k, v in actor_sd.items()}
             for gpu_id in rollout_gpu_ids:
                 e_enc, e_actor = eval_modules[gpu_id]
                 dev = f"cuda:{gpu_id}"
-                e_enc.load_state_dict({k: v.to(dev) for k, v in enc_state_cpu.items()})
-                e_actor.load_state_dict({k: v.to(dev) for k, v in actor_state_cpu.items()})
+                # Direct parameter copy: avoids load_state_dict(assign=True) + .to(dev) thrash
+                with torch.cuda.device(dev):
+                    for name, param in e_enc.named_parameters():
+                        param.data.copy_(enc_cpu[name], non_blocking=True)
+                    for name, param in e_actor.named_parameters():
+                        param.data.copy_(actor_cpu[name], non_blocking=True)
+                    for name, buf in e_enc.named_buffers():
+                        if name in enc_cpu:
+                            buf.data.copy_(enc_cpu[name], non_blocking=True)
+                    for name, buf in e_actor.named_buffers():
+                        if name in actor_cpu:
+                            buf.data.copy_(actor_cpu[name], non_blocking=True)
+        # Sync
+        for gpu_id in rollout_gpu_ids:
+            torch.cuda.synchronize(f"cuda:{gpu_id}")
 
     def _run_eval_inline(iteration, save_video):
         """Synchronous eval body — same logic as before but uses eval_modules.
@@ -654,6 +755,14 @@ def run_rl_offpolicy(args):
                     all_eps, replay_buffer, gamma_per_step=args.gamma)
 
             rollout_stats_queue.put((all_eps, it, n_pushed))
+
+            # ── GPU memory cleanup: 每次迭代清理Rollout GPU缓存 ──
+            # 每次VLA forward产生~290MB hidden_states中间张量, del后PyTorch缓存分配器
+            # 不会自动归还显存。每次迭代清理可避免碎片化累积导致OOM。
+            gc.collect()
+            for gpu_id in rollout_gpu_ids:
+                with torch.cuda.device(f"cuda:{gpu_id}"):
+                    torch.cuda.empty_cache()
         except Exception as e:
             import traceback
             logger.error(f"!!! Rollout thread CRASHED at iter {it}: {e}")
@@ -670,11 +779,12 @@ def run_rl_offpolicy(args):
     # ── Training loop (async rollout + TD updates) ────
     # Launch rollout in background
     rollout_thread = threading.Thread(
-        target=_rollout_thread_fn, args=(1, args.max_iter), daemon=True)
+        target=_rollout_thread_fn, args=(start_iter, args.max_iter), daemon=True)
     rollout_thread.start()
     logger.info("Started async rollout thread")
 
     td_global_step = 0
+    td3_step_loss_history = []  # Collect per-TD-step loss curves for saving at end
     last_sync_step = 0
     sync_every_n_updates = 500  # sync weights to rollout every N TD3 updates
 
@@ -683,7 +793,7 @@ def run_rl_offpolicy(args):
         action_token_td_critic_update,
     )
 
-    for iteration in range(1, args.max_iter + 1):
+    for iteration in range(start_iter, args.max_iter + 1):
         # ── Drain all available rollout data (non-blocking after first) ────
         all_episodes = []
         # Block on first get (wait for rollout to produce data)
@@ -741,6 +851,46 @@ def run_rl_offpolicy(args):
             logger.info(f"=== VLA warmup done. Buffer pre-filled with {len(replay_buffer)} "
                          f"transitions. Starting TD3 training. ===")
 
+            # ── Actor BC Pretrain ──
+            if args.bc_pretrain_steps > 0 and replay_buffer.is_ready(min_size=args.buffer_warmup):
+                logger.info(f"[BC Pretrain] Pre-training actor on {len(replay_buffer)} buffer "
+                             f"transitions for {args.bc_pretrain_steps} steps "
+                             f"(lr={args.lr_actor}, β BC loss only, no Q)...")
+                actor.train()
+                bc_pretrain_optimizer = torch.optim.Adam(actor.parameters(), lr=args.lr_actor)
+                n_tasks_bc = len(args._selected_task_ids) if args._selected_task_ids else (
+                    n_tasks if args.all_tasks else 0)
+                batch_sz_bc = min(args.td_batch_size, len(replay_buffer))
+                bc_losses = []
+                for bc_step in range(args.bc_pretrain_steps):
+                    bc_pretrain_optimizer.zero_grad()
+                    if n_tasks_bc > 0:
+                        rl_tok_bc, vla_act_bc, _, _, _, _, _, prop_bc, _ = \
+                            replay_buffer.sample_balanced(batch_sz_bc, n_tasks=n_tasks_bc,
+                                                          device=train_device,
+                                                          success_weight=args.success_weight)
+                    else:
+                        rl_tok_bc, vla_act_bc, _, _, _, _, _, prop_bc, _ = \
+                            replay_buffer.sample(batch_sz_bc, device=train_device)
+                    action_bc, _ = actor(rl_tok_bc, vla_act_bc, prop_bc, deterministic=False)
+                    bc_loss = ((action_bc - vla_act_bc) ** 2).sum(dim=(-2, -1)).mean()
+                    bc_loss.backward()
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
+                    bc_pretrain_optimizer.step()
+                    bc_losses.append(bc_loss.item())
+                    if (bc_step + 1) % 500 == 0:
+                        logger.info(f"  [BC Pretrain] step {bc_step+1}/{args.bc_pretrain_steps} "
+                                     f"loss={np.mean(bc_losses[-100:]):.6f}")
+                # Sync pretrained actor to rollout servers
+                _sync_rollout_weights()
+                logger.info(f"[BC Pretrain] Done. Final avg loss={np.mean(bc_losses[-200:]):.6f}. "
+                             f"Actor weights synced to rollout.")
+                # Also sync target networks to match pretrained actor
+                soft_update_target(actor, target_actor, tau=1.0)
+                soft_update_target(q_critic, target_q_critic, tau=1.0)
+                logger.info(f"[BC Pretrain] Target networks hard-synced (tau=1.0).")
+
         # ── Async TD3 updates: run UTD×new_data updates per new data batch ──
         # Paper Algorithm 1: TD updates run EVERY step (including warmup),
         # warmup only controls which action is used for rollout (VLA vs actor).
@@ -771,6 +921,7 @@ def run_rl_offpolicy(args):
                     target_noise_clip=args.target_noise_clip,
                     n_tasks=n_tasks_for_balance,
                     target_actor=target_actor,
+                    success_weight=args.success_weight,
                 )
                 critic_loss.backward()
                 if args.max_grad_norm > 0:
@@ -788,6 +939,7 @@ def run_rl_offpolicy(args):
                         beta=args.beta,
                         device=train_device,
                         n_tasks=n_tasks_for_balance,
+                        success_weight=args.success_weight,
                     )
                     actor_loss.backward()
                     if args.max_grad_norm > 0:
@@ -798,6 +950,16 @@ def run_rl_offpolicy(args):
 
                 td_stats_list.append({**c_stats, **a_stats,
                                       "td_loss": c_stats["critic_loss"] + a_stats["actor_loss"]})
+                # ── Record per-step loss for loss curve saving ──
+                td3_step_loss_history.append({
+                    "td_step": td_global_step,
+                    "iteration": iteration,
+                    "critic_loss": c_stats["critic_loss"],
+                    "actor_loss": a_stats["actor_loss"],
+                    "q1_mean": c_stats.get("q1_mean", 0.0),
+                    "q2_mean": c_stats.get("q2_mean", 0.0),
+                    "bc_penalty": a_stats.get("bc_penalty", 0.0),
+                })
                 td_global_step += 1
 
             avg_td = np.mean([s["td_loss"] for s in td_stats_list])
@@ -987,6 +1149,15 @@ def run_rl_offpolicy(args):
             save_rlt_checkpoint(enc_dec, actor, q_critic,
                                 iteration, args.output_dir, phase="rl_offpolicy")
 
+        # ── 8. Memory cleanup ────────────────────────────
+        # Explicitly free episode references to GPU tensors
+        if 'td_stats_list' in dir():
+            td_stats_list.clear()
+        all_episodes.clear()
+        del eps_batch
+        gc.collect()
+        torch.cuda.empty_cache()
+
     # Stop rollout thread
     _stop_rollout.set()
     rollout_thread.join(timeout=10)
@@ -1022,6 +1193,54 @@ def run_rl_offpolicy(args):
     # Final save
     save_rlt_checkpoint(enc_dec, actor, q_critic,
                         args.max_iter, args.output_dir, phase="rl_offpolicy")
+
+    # ── Save TD3 loss curves ─────────────────────────────────
+    loss_curves_path = Path(args.output_dir) / "td3_loss_curves.json"
+    with open(loss_curves_path, "w") as f:
+        json.dump(td3_step_loss_history, f, indent=2)
+    logger.info(f"TD3 loss curves saved -> {loss_curves_path} ({len(td3_step_loss_history)} steps)")
+
+    # ── Plot loss curves (if matplotlib available) ───────────
+    if len(td3_step_loss_history) > 1:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            td_steps = [s["td_step"] for s in td3_step_loss_history]
+            critic_losses = [s["critic_loss"] for s in td3_step_loss_history]
+            actor_losses = [s["actor_loss"] for s in td3_step_loss_history]
+
+            fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+            # Critic loss
+            axes[0].plot(td_steps, critic_losses, label="Critic Loss", color="tab:blue", alpha=0.7, linewidth=0.5)
+            axes[0].set_ylabel("Critic Loss (MSE)")
+            axes[0].set_title("TD3 Critic Loss per TD Step")
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            # Actor loss (skip zero entries where actor wasn't updated)
+            nonzero_mask = [s["actor_loss"] > 1e-8 for s in td3_step_loss_history]
+            td_steps_actor = [s["td_step"] for s, m in zip(td3_step_loss_history, nonzero_mask) if m]
+            actor_losses_nonzero = [s["actor_loss"] for s, m in zip(td3_step_loss_history, nonzero_mask) if m]
+            axes[1].plot(td_steps_actor, actor_losses_nonzero, label="Actor Loss", color="tab:orange", alpha=0.7, linewidth=0.5)
+            axes[1].set_xlabel("TD Step")
+            axes[1].set_ylabel("Actor Loss")
+            axes[1].set_title("TD3 Actor Loss per TD Step (only on update steps)")
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path = Path(args.output_dir) / "td3_loss_curves.png"
+            plt.savefig(str(plot_path), dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"TD3 loss curves plot saved -> {plot_path}")
+        except ImportError:
+            logger.warning("matplotlib not installed — skipping loss curve plot")
+        except Exception as e:
+            logger.warning(f"Failed to plot loss curves: {e}")
+
     metrics_path = Path(args.output_dir) / "metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     with open(metrics_path, "w") as f:
