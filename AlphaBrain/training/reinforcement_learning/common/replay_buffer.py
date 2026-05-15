@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 
+# 所有经验存入容量 1M 的环形 buffer，可被重复采样
 class ReplayBuffer:
     """Fixed-capacity ring buffer for off-policy experience replay."""
 

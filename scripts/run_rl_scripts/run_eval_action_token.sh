@@ -36,9 +36,9 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 # ── Edit these before running ────────────────────────────────
 VLA_CKPT="data/final_run"
-RUN_DIR=${1:-"results/action_token_training_TD3/rlt_singletask_task0_v2_0513_1354/rl_offpolicy"}
+RUN_DIR=${1:-"results/action_token_training_TD3/singletask_resume_v2_0514_1122/rl_offpolicy"}
 
-ITER="iter_00100"
+ITER="iter_00160"
 GPU_IDS=${2:-"1"}          # Use GPU 1 (GPU 0 may have lingering processes)
 TASK_IDS=${3:-"0"}         # comma-separated list; default: only task 0 (single-task)
 SAVE_EVAL_VIDEOS=${SAVE_EVAL_VIDEOS:-true}   # set to false to skip video saving

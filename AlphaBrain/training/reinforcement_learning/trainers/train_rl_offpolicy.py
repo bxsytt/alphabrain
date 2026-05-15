@@ -50,6 +50,7 @@ def run_rl_offpolicy(args):
     set_seed(args.seed)
 
     # ── Parse GPU config ─────────────────────────────────
+    # “采样与训练分离”：用一部分 GPU 专门负责运行环境并收集数据（Rollout），另一块 GPU 专门负责更新模型参数（Train）
     if args.rollout_gpus is not None:
         rollout_gpu_ids = [int(g.strip()) for g in args.rollout_gpus.split(",")]
     else:
@@ -57,6 +58,7 @@ def run_rl_offpolicy(args):
 
     train_gpu_id = args.train_gpu if args.train_gpu is not None else rollout_gpu_ids[0]
     train_device = f"cuda:{train_gpu_id}"
+    # 采样 GPU 的总数量。这个数字通常决定了你能并行运行多少个环境进程，直接影响数据的收集速度
     n_rollout_gpus = len(rollout_gpu_ids)
 
     logger.info(f"=== Off-Policy TD Mode (Split GPU) ===")
@@ -382,6 +384,9 @@ def run_rl_offpolicy(args):
     _stop_rollout = threading.Event()
     _weight_sync_lock = threading.Lock()  # protects weight copy (non-blocking)
 
+    # 数据收集与训练完全异步，rollout 使用的总是陈旧权重（每 500 步才同步一次）
+    # train_rl_offpolicy.py的 792：   sync_every_n_updates = 500 
+    # 把 train GPU 上的 actor/encoder/critic 权重拷贝到所有 rollout GPU 上
     def _sync_rollout_weights():
         """Copy latest actor/encoder weights to all rollout GPU copies (in-place, no temp GPU tensors).
 
@@ -902,6 +907,7 @@ def run_rl_offpolicy(args):
             batch_sz = min(args.td_batch_size, len(replay_buffer))
 
             # UTD-based: n_updates = new_transitions × utd_ratio / batch_size
+            #  每采集一批新数据，重复采样训练约 90 次，大量复用旧数据
             n_new_transitions = n_pushed
             n_updates = max(1, int(n_new_transitions * args.utd_ratio / batch_sz))
             n_updates = min(n_updates, args.td_updates_per_iter)  # cap

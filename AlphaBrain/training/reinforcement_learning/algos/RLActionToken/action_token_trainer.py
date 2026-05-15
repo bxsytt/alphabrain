@@ -141,10 +141,12 @@ class BatchInferenceServer:
 
             with torch.no_grad():
                 with torch.autocast("cuda", dtype=torch.bfloat16):
+                    # VLA forward输出
                     action_queries, vla_actions = self.frozen_vla.get_vla_action(
                         batch_images=batch_images,
                         instructions=batch_instrs,
                     )
+                # encoder输出
                 rl_tokens = self.encoder.encode(action_queries)                   # (B, 1, D)
 
                 # Stack proprioceptive states for actor/critic
@@ -169,6 +171,7 @@ class BatchInferenceServer:
 
                 if self.warmup_mode:
                     # VLA warmup: return VLA actions directly, no actor modification
+                    # actor输出
                     actions = vla_actions_for_actor
                     log_probs = torch.zeros(B, device=self.device)
                     values = torch.zeros(B, device=self.device)
@@ -347,7 +350,7 @@ def collect_observations_fast(
     logger.info(f"  [collect_obs] Collected {len(observations)} observations")
     return observations
 
-
+# 从原始观测数据中利用冻结的 VLA 模型（Vision-Language-Action Model）提取动作查询向量
 def extract_action_queries_from_obs(
     frozen_vla,
     observations: list,
@@ -368,8 +371,8 @@ def extract_action_queries_from_obs(
     all_queries = []
     for b_idx, start in enumerate(range(0, N, batch_size)):
         end = min(start + batch_size, N)
-        batch_imgs = [observations[i][0] for i in range(start, end)]
-        batch_instr = [observations[i][1] for i in range(start, end)]
+        batch_imgs = [observations[i][0] for i in range(start, end)]     # 图像列表
+        batch_instr = [observations[i][1] for i in range(start, end)]    # 指令文本字符串
         with torch.no_grad():
             aq = frozen_vla.get_action_queries(
                 batch_images=batch_imgs,

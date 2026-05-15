@@ -63,7 +63,7 @@ class ActionTokenEncoder(nn.Module):
         self.bottleneck_dim = bottleneck_dim
 
         # Learnable RL embedding e_rl (appended to token sequence)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim) * 0.02)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim) * 0.02)    # [1,1,2048],
 
         # Self-attention encoder layers (paper: g_φ processes [z_{1:M}, e_rl])
         self.self_attn_layers = nn.ModuleList([
@@ -78,6 +78,16 @@ class ActionTokenEncoder(nn.Module):
         ])
         self.bottleneck_proj = nn.Linear(input_dim, bottleneck_dim)
 
+    """
+    输入: action_queries (B, M, H)
+        1. 附加可学习 e_rl token: → (B, M+1, H)
+        2. 多层 Transformer self-attention
+        3. 取 e_rl 位置输出 → Linear(H → D_bottleneck)
+    输出: rl_token (B, 1, D_bottleneck)
+
+    附加一个可学习的 e_rl token 到 action_queries 序列末尾，经过多层 Transformer self-attention，
+    取 e_rl 位置的输出，再通过线性投影压缩到瓶颈维度 → 得到 rl_token (B, 1, D_bottleneck)
+    """
     def forward(self, action_queries: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -142,6 +152,19 @@ class ActionTokenDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
+    """
+    输入: rl_token (B, 1, D_bottleneck) + target_tokens (B, M, H)
+        1. 投影 rl_token 回到 H 维: → (B, 1, H)
+        2. Teacher Forcing: 输入序列 = [z_rl, sg(z_1), sg(z_2), ..., sg(z_{M-1})]
+        - sg = stop-gradient，即 .detach()
+        3. 加位置编码
+        4. Causal mask 确保自回归结构
+        5. 多层 Transformer self-attention
+    输出: reconstructed (B, M, H) — 每个位置对应原始 z_i 的重构
+
+    以 rl_token 为前缀，采用 Teacher Forcing 模式自回归重构：输入是 [z_rl, sg(z_1), sg(z_2), ..., sg(z_{M-1})]，
+    输出预测 [z_1, z_2, ..., z_M]，所有目标都经过 stop-gradient（.detach()）
+    """
     def forward(
         self,
         rl_token: torch.Tensor,
@@ -168,18 +191,22 @@ class ActionTokenDecoder(nn.Module):
             seq = seq + self.pos_embed                         # add positional info
         else:
             # Inference: use positional embeddings (no teacher forcing)
+            # 没有真实动作参考，直接把 prefix 复制 M 份，然后加上 位置编码 (pos_embed)，让每一位根据自己的“位置感”来生成动作。
             seq = prefix.expand(-1, self.chunk_len, -1) + self.pos_embed  # (B, M, H)
 
         # Causal mask: position i can only attend to positions <= i
         # This ensures autoregressive structure
         M = seq.size(1)
+        # 因果掩码：确保在计算第 i 个位置的动作时，模型只能看到之前的 Token，不能“偷看”后面的 Token。
         causal_mask = torch.triu(
             torch.ones(M, M, device=seq.device, dtype=torch.bool), diagonal=1
         )  # True = masked out
 
+        # 将序列送入多层 Transformer Block。每一层都会利用 causal_mask 进行自注意力计算，让序列中的每个位置通过上下文信息进行演化
         for layer in self.self_attn_layers:
             seq = layer(seq, src_mask=causal_mask, is_causal=True)
 
+        # 在序列的每一个位置 i，输出的向量就是对目标动作 Token z_i 的预测
         return seq  # (B, M, H) — each position predicts the corresponding target
 
 
@@ -251,5 +278,6 @@ class ActionTokenEncoderDecoder(nn.Module):
         rl_token = self.encoder(action_queries)
         # Autoregressive decode with teacher forcing
         reconstructed = self.decoder(rl_token, target_tokens=action_queries.detach())
+        # 自回归重构的 MSE 损失，迫使 rl_token 瓶颈保留足够多的原始 VLA 信息
         recon_loss = F.mse_loss(reconstructed, action_queries.detach())
         return rl_token, recon_loss

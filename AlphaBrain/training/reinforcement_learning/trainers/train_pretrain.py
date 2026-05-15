@@ -18,7 +18,7 @@ from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token
 
 logger = logging.getLogger(__name__)
 
-
+# 先收集数据 → 用冻结的 VLA 提取 latent 表示 → 训练 encoder-decoder 做自监督rlt
 def run_pretrain(args):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -64,13 +64,14 @@ def run_pretrain(args):
     logger.info(f"RLActionToken Encoder-Decoder: {n_params / 1e6:.2f}M parameters")
 
     optimizer = torch.optim.AdamW(enc_dec.parameters(), lr=args.pretrain_lr)
-
     # WandB
     if args.use_wandb:
         run_name = args.run_name or f"action_token_pretrain_{args.suite}"
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     # Phase 1a: Fast observation collection (no VLA forward, just env resets + random steps)
+    # 通过随机探索收集原始观察数据（图像+指令），作为后续训练 encoder-decoder 的训练数据来源。
+    # 最终每一个 observation 都是一个字典，包含图像观测和自然语言指令
     if args.all_tasks:
         logger.info(f"Collecting {args.pretrain_n_obs} observations from ALL {n_tasks} tasks...")
         observations = []
@@ -104,6 +105,9 @@ def run_pretrain(args):
         )
 
     # Phase 1b: Batch-extract all action_queries via frozen VLA (one-time GPU work)
+    # 用 冻结的 frozen VLA 把收集到的原始观测 批量送入 VLA 做一次前向推理，提取出 action token 位置处的
+    # 隐藏状态序列（action_queries）→ 得到 (N, chunk_len, hidden_dim) 的张量。
+    # 结束后立即释放 VLA 模型
     logger.info(f"Extracting action_queries from {len(observations)} observations (batch VLA forward)...")
     all_queries = extract_action_queries_from_obs(
         frozen_vla=frozen_vla,
@@ -121,8 +125,11 @@ def run_pretrain(args):
     logger.info("Freed frozen VLA from GPU memory")
 
     # Phase 1c: Train encoder-decoder purely on cached tensors (fast, high GPU util)
+    # 用 Phase 1b 产出的 cached action_queries 训练 ActionTokenEncoderDecoder。
+    # 损失函数是 重建损失（reconstruction loss）——encoder 把 action_queries 压缩成一个
+    # 紧凑的 latent token，decoder 再从中重建出原始 action_queries。
     enc_dec.train()
-    best_loss = float("inf")
+    best_loss = float("inf")   # 跟踪最佳重构损失
     bs = args.pretrain_batch_size
     global_step = 0
 
