@@ -34,11 +34,37 @@ def _write_msg(proc: subprocess.Popen, obj: dict):
     proc.stdin.flush()
 
 
-def _read_msg(proc: subprocess.Popen) -> dict:
+_READ_MSG_TIMEOUT = 30.0  # seconds; 防止子进程卡死导致父进程永久阻塞
+
+
+def _read_msg(proc: subprocess.Popen, timeout: float = _READ_MSG_TIMEOUT) -> dict:
+    """读取子进程的 msgpack 响应，带超时机制防止死锁。"""
+    import select
+
+    # 等待子进程 stdout 可读，最多 timeout 秒
+    readable, _, _ = select.select([proc.stdout], [], [], timeout)
+    if not readable:
+        # 超时 —— 子进程可能卡在 stderr buffer 或其他原因
+        _stderr_snapshot = ""
+        try:
+            if proc.stderr is not None:
+                _stderr_snapshot = proc.stderr.read().decode(errors="replace")[:2000]
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"LIBERO worker response timeout ({timeout}s). "
+            f"stderr (last 2000 chars):\n{_stderr_snapshot}"
+        )
+
     raw_len = proc.stdout.read(4)
     if not raw_len:
-        stderr = proc.stderr.read().decode(errors="replace")
-        raise RuntimeError(f"LIBERO worker exited unexpectedly.\nWorker stderr:\n{stderr}")
+        _stderr_content = ""
+        try:
+            if proc.stderr is not None:
+                _stderr_content = proc.stderr.read().decode(errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"LIBERO worker exited unexpectedly.\nWorker stderr:\n{_stderr_content}")
     length = struct.unpack("<I", raw_len)[0]
     data = proc.stdout.read(length)
     return msgpack.unpackb(data, raw=False)
@@ -80,16 +106,30 @@ class LiberoEnv:
         # Inherit the current env so LIBERO can find its own packages.
         # Inject LIBERO_HOME into PYTHONPATH so the editable install is not required.
         worker_env = os.environ.copy()
+        # Strip debugpy/pydevd env vars so the worker subprocess runs
+        # normally (not intercepted by debugpy --multiprocess), which
+        # would break the msgpack-based stdin/stdout protocol.
+        for _key in list(worker_env.keys()):
+            _key_upper = _key.upper()
+            if "PYDEVD" in _key_upper or "DEBUGPY" in _key_upper:
+                del worker_env[_key]
         libero_home = os.environ.get("LIBERO_HOME", "")
         if libero_home:
             existing = worker_env.get("PYTHONPATH", "")
             worker_env["PYTHONPATH"] = f"{libero_home}:{existing}" if existing else libero_home
 
+        # ── 修复子进程 stderr pipe buffer 死锁 ──
+        # 问题: LIBERO 环境初始化时输出大量日志到 stderr，pipe buffer 很快填满，
+        #       导致子进程阻塞在 write(stderr) 上，永远无法写到 stdout 响应。
+        #       父进程同时阻塞在 _read_msg(stdout) 上，形成死锁。
+        # 解决: stderr 重定向到 DEVNULL（避免 buffer 死锁），
+        #       同时给 _read_msg 添加超时防止永久阻塞。
+        stderr_target = subprocess.DEVNULL
         self._proc = subprocess.Popen(
             [python_bin, _WORKER_SCRIPT],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr_target,
             env=worker_env,
         )
 

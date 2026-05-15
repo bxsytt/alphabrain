@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
+import time
 
 from typing import List
 
@@ -128,6 +129,7 @@ class BaseFramework(PreTrainedModel):
 
             config = dict_to_namespace(model_config)
             config.trainer.pretrained_checkpoint = None
+            _t = time.time()
 
             # 单次加载优化 - 如果checkpoint目录包含vlm_pretrained/（兼容旧名qwen_pretrained/），
             # 直接从中加载tokenizer/config，用meta device创建模型骨架，由后续load_state_dict一次性加载所有权重
@@ -151,9 +153,13 @@ class BaseFramework(PreTrainedModel):
                     logger.warning("vlm_pretrained/ found but no VLM config key detected, skipping single-read optimization")
             else:
                 logger.warning(f"No vlm_pretrained/ found (or empty), falling back to two-read loading from original base_vlm")
+            logger.info(f"[timing] Config + VLM setup: {time.time()-_t:.1f}s")
+            _t = time.time()
 
             FrameworkModel = build_framework(cfg=config)
             FrameworkModel.norm_stats = norm_stats
+            logger.info(f"[timing] build_framework: {time.time()-_t:.1f}s")
+            _t = time.time()
 
             # lpt0309: 从目录中找到权重文件
             weights_path = pretrained_checkpoint / "model.safetensors"
@@ -163,15 +169,18 @@ class BaseFramework(PreTrainedModel):
                 weights_path = pretrained_checkpoint / "latest_model.pt"
             assert weights_path.exists(), f"[lpt0309] No weights file found in {pretrained_checkpoint}"
 
+            # lpt0509: Load state_dict to CPU. The model was built via meta device → to_empty(cpu),
+            # so both model and state dict are on CPU. This avoids GPU OOM (the 7.6GB checkpoint
+            # cannot fit in the ~7GB GPU headroom after model construction).
+            # The caller (train_pretrain.py) moves the model to GPU afterward via .to(device).
+            _map_dev = "cpu"
             if weights_path.suffix == ".safetensors":
                 from safetensors.torch import load_file
                 model_state_dict = load_file(str(weights_path))
             else:
-                # lpt0509: Load state_dict directly to CUDA to avoid CPU OOM (~7.6GB on CPU would
-                # exceed the ~9.9GB available RAM when combined with the model structure).
-                # GPU VRAM (24GB) has plenty of headroom for the temporary state dict.
-                _map_dev = "cuda" if torch.cuda.is_available() else "cpu"
                 model_state_dict = torch.load(weights_path, map_location=_map_dev)
+            logger.info(f"[timing] torch.load (map={_map_dev}): {time.time()-_t:.1f}s")
+            _t = time.time()
 
             logger.info(f"[lpt0309] Loading weights from {weights_path}")
             
@@ -187,7 +196,9 @@ class BaseFramework(PreTrainedModel):
                 if n_remapped > 0:
                     logger.info(f"Remapped {n_remapped} keys from vlm.* to qwen_vl_interface.*")
             model_state_dict = remapped
-            
+            logger.info(f"[timing] Key remapping: {time.time()-_t:.1f}s")
+            _t = time.time()
+
             model_keys = set(FrameworkModel.state_dict().keys())
             checkpoint_keys = set(model_state_dict.keys())
             # Try strict first; fall back to non-strict if only non-critical keys mismatch
@@ -204,6 +215,7 @@ class BaseFramework(PreTrainedModel):
                 # Fall back to non-strict loading for cross-framework weight loading (e.g. openpi → AlphaBrain)
                 logger.warning(f"Strict loading failed, falling back to non-strict (missing={len(missing_keys)}, unexpected={len(unexpected_keys)})")
                 FrameworkModel.load_state_dict(model_state_dict, strict=False)
+            logger.info(f"[timing] load_state_dict: {time.time()-_t:.1f}s")
 
             logger.info(
                 "[lpt0324] Successfully loaded model from self-contained checkpoint "

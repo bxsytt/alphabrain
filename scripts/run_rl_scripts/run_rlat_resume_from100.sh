@@ -9,7 +9,7 @@
 #   4. 参数对齐原 singletask_v2：success_weight=5.0, td_updates_per_iter=50000, eval_interval=10, save_interval=10
 # ============================================================
 
-RESUME_CKPT="/home/zlb/embody_project/AlphaBrain/results/action_token_training_TD3/rlt_singletask_task0_v2_0513_1354/rl_offpolicy/checkpoints/rl_offpolicy_iter_00100"
+RESUME_CKPT="/home/zlb/embody_project/AlphaBrain/results/action_token_training_TD3/singletask_resume_v2_0514_1122/rl_offpolicy/checkpoints/rl_offpolicy_iter_00200"
 NEW_DIR="results/action_token_training_TD3/singletask_resume_v2_$(date +%m%d_%H%M)/rl_offpolicy"
 
 python AlphaBrain/training/reinforcement_learning/trainers/train.py \
@@ -51,11 +51,11 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --actor_update_freq 2 \
     --target_noise_std 0.2 \
     --target_noise_clip 0.5 \
-    --max_iter 200 \
-    --eval_interval 20 \
-    --eval_n_episodes 20 \
-    --save_interval 20 \
-    --save_video_interval 20 \
+    --max_iter 400 \
+    --eval_interval 50 \
+    --eval_n_episodes 50 \
+    --save_interval 50 \
+    --save_video_interval 50 \
     --seed 42 \
     --use_wandb \
     --wandb_project AlphaBrain_RLT \

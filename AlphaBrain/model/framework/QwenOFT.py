@@ -261,20 +261,18 @@ class Qwenvl_OFT(BaseFramework):
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images, instructions=instructions
         )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+        qwenvl_outputs = self.qwen_vl_interface(
+            **qwen_inputs,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
-        with torch.autocast("cuda", dtype=torch.float32):
-            input_ids = qwen_inputs.get("input_ids", None)
-            action_queries = self._gather_action_token_embeddings(
-                last_hidden, input_ids, action_token_id=self.action_token_id
-            )
+        input_ids = qwen_inputs.get("input_ids", None)
+        action_queries = self._gather_action_token_embeddings(
+            last_hidden, input_ids, action_token_id=self.action_token_id
+        )
 
         # ── 显存优化：显式释放中间隐状态（36层全部释放） ──
         # qwenvl_outputs.hidden_states 包含所有Transformer层的输出，

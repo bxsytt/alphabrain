@@ -270,29 +270,30 @@ def collect_observations_fast(
     just reset envs to diverse initial states and take a few random steps.
     Returns list of (images, instruction) tuples ready for VLA forward.
 
-    Much faster than collect_group: no VLA forward during collection,
-    no action caching, just random exploration for observation diversity.
+    Uses _FastLiberoEnv (socket-based IPC, raw bytes, MuJoCo env reuse)
+    instead of the old LiberoEnv (pipe+PNG based, prone to deadlock).
     """
-    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import _FastLiberoEnv
 
     observations = []
 
-    # Shared progress counter across threads
     obs_per_reset = 1 + steps_per_env
     n_resets = max(1, (n_observations + obs_per_reset - 1) // obs_per_reset)
     resets_per_env = (n_resets + num_envs - 1) // num_envs
-    progress_lock = threading.Lock()
-    progress = {"resets_done": 0, "obs_count": 0}
-    log_interval = max(1, n_resets // 20)  # log every ~5%
+    log_interval = max(1, n_resets // 20)
 
     logger.info(f"  [collect_obs] Plan: {n_resets} env resets × {steps_per_env} steps/reset "
                 f"= ~{n_resets * obs_per_reset} obs, using {num_envs} envs")
 
+    # Thread-safe progress counter
+    _progress_lock = __import__('threading').Lock()
+    _progress = {"done": 0}
+
     def _collect_from_env(env_idx, states_to_visit):
         local_rng = np.random.RandomState(seed + env_idx * 10000)
         local_obs = []
-        env = LiberoEnv(libero_python=libero_python)
+        env = _FastLiberoEnv(libero_python=libero_python)
         try:
             for s_idx in states_to_visit:
                 obs = env.reset(
@@ -302,8 +303,9 @@ def collect_observations_fast(
                     seed=seed + env_idx * 1000 + s_idx,
                 )
                 task_desc = env.task_description
+                # _FastLiberoEnv returns raw numpy arrays, ready for VLA forward
                 local_obs.append((
-                    [obs["primary_image"].copy(), obs["wrist_image"].copy()],
+                    [obs["primary_image"], obs["wrist_image"]],
                     task_desc,
                 ))
                 for _ in range(steps_per_env):
@@ -311,19 +313,18 @@ def collect_observations_fast(
                     random_action[6] = local_rng.choice([-1.0, 1.0])
                     obs, _, done = env.step(random_action)
                     local_obs.append((
-                        [obs["primary_image"].copy(), obs["wrist_image"].copy()],
+                        [obs["primary_image"], obs["wrist_image"]],
                         task_desc,
                     ))
                     if done:
                         break
-                # Update shared progress
-                with progress_lock:
-                    progress["resets_done"] += 1
-                    rd = progress["resets_done"]
-                    if rd % log_interval == 0 or rd == n_resets:
-                        est_obs = rd * obs_per_reset
-                        logger.info(f"  [collect_obs] reset {rd}/{n_resets} "
-                                    f"({rd * 100 // n_resets}%), ~{est_obs} obs collected")
+                with _progress_lock:
+                    _progress["done"] += 1
+                    rd = _progress["done"]
+                if rd % log_interval == 0 or rd == n_resets:
+                    est_obs = rd * obs_per_reset
+                    logger.info(f"  [collect_obs] reset {rd}/{n_resets} "
+                                f"({rd * 100 // n_resets}%), ~{est_obs} obs collected")
         finally:
             env.close()
         return local_obs

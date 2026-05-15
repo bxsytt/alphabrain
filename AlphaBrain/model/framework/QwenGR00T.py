@@ -70,7 +70,11 @@ class Qwen_GR00T(BaseFramework):
         """
         super().__init__()
         self.config = config
+        import time as _time
+        _t = _time.time()
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        logger.info(f"[timing] Qwen_GR00T: get_vlm_model: {_time.time()-_t:.1f}s")
+        _t = _time.time()
         # align dims --> we should put them to config or no?
         # align dims: use world_model hidden_size (post-fusion) if available, else VLM hidden_size
         wm_cfg = getattr(self.config.framework, "world_model", None)
@@ -98,6 +102,7 @@ class Qwen_GR00T(BaseFramework):
         logger.info(f"[QwenGR00T] Detected cross_attention_dim: {dim}")
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
+        logger.info(f"[timing] Qwen_GR00T: get_action_model: {_time.time()-_t:.1f}s")
 
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
@@ -427,15 +432,14 @@ class Qwen_GR00T(BaseFramework):
             instructions=instructions
         )
         
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # last_hidden: [B, L, H] — VLM full output sequence (variable L)
-            last_hidden = qwenvl_outputs.hidden_states[-1]
+        qwenvl_outputs = self.qwen_vl_interface(
+            **qwen_inputs,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        # last_hidden: [B, L, H] — VLM full output sequence (variable L)
+        last_hidden = qwenvl_outputs.hidden_states[-1]
 
         # 3. 将变长序列 (B, L, H) 自适应池化到固定长度 (B, chunk_len, H)
         #    确保与下游 ActionTokenEncoderDecoder 兼容（要求固定 M=chunk_len）
