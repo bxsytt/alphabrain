@@ -853,7 +853,20 @@ def push_episodes_to_buffer(
         → 产生 3 条 transitions
         总计：4 + 4 + 3 = 11 条 transitions。
     """
+    
     n_pushed = 0
+    
+    # Debug: log episode stats before processing
+    if len(episodes) > 0 and episodes[0].step_records:
+        _debug_chunk_len = episodes[0].step_records[0].action_taken.shape[0]
+        _debug_stride = 2
+        _debug_stride_pos = list(range(0, _debug_chunk_len, _debug_stride))
+        _debug_msg = (f"[DEBUG push_episodes_to_buffer] {len(episodes)} eps, "
+                      f"chunk_len={_debug_chunk_len}, stride_positions={_debug_stride_pos}, "
+                      f"finish_steps={[ep.finish_step for ep in episodes]}")
+        print(_debug_msg, flush=True)
+        logger.info(_debug_msg)
+    
     # 1. 第一层 for ep in episodes：遍历每一个独立的尝试（轨迹）
     for ep in episodes:
         steps = ep.step_records
@@ -1114,7 +1127,7 @@ def action_token_td_critic_update(
         target = target.clamp(max=q_upper)    # 逆向裁剪了一个自适应上界, 防止 bootstrap 过程中 Q 值无限膨胀
 
     # ── Online Q loss ──
-    # 在线的 q1 和 q2 分别去预测当前状态和动作的 Q 值
+    # 在线的 q1 和 q2 分别去预测当前状态和动作的 Q 值 (paper: Eq.3)
     q1, q2 = q_critic(rl_tok, act_taken, prop)
     critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
 

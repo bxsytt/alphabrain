@@ -13,7 +13,7 @@
 
 RUN_NAME="rlt_singletask_task0_v2_$(date +%m%d_%H%M)"
 CKPT_PATH="data/final_run"
-ENCODER_PATH="results/rlt_training_TD3/5traj_alltasks_pretrain/pretrain/checkpoints/pretrain_best/encoder.pt"
+ENCODER_PATH="results/rlt_training_TD3/phase1_pretrain/pretrain/checkpoints/pretrain_best/encoder.pt"
 OUTPUT_DIR="results/action_token_training_TD3/${RUN_NAME}/rl_offpolicy"
 
 source $(conda info --base)/etc/profile.d/conda.sh
@@ -70,11 +70,11 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --actor_update_freq 2 \
     --target_noise_std 0.2 \
     --target_noise_clip 0.5 \
-    --max_iter 100 \
-    --eval_interval 10 \
-    --eval_n_episodes 10 \
-    --save_interval 10 \
-    --save_video_interval 100 \
+    --max_iter 200 \
+    --eval_interval 20 \
+    --eval_n_episodes 20 \
+    --save_interval 20 \
+    --save_video_interval 20 \
     --seed 42 \
     --use_wandb \
     --wandb_project AlphaBrain_RLT \

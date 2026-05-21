@@ -161,17 +161,32 @@ class _FastLiberoEnv:
             raise RuntimeError(f"Worker error: {resp.get('message', 'unknown')}")
         return _parse_obs(resp["obs"]), resp["reward"], resp["done"]
 
-    def step_chunk(self, actions: list) -> Tuple[dict, float, bool, int]:
-        """Execute multiple actions in one round-trip. Returns (obs, reward, done, steps_taken)."""
+    def step_chunk(self, actions: list, sub_positions: Optional[list] = None) -> Tuple[dict, float, bool, int, list]:
+        """Execute multiple actions in one round-trip. Returns (obs, reward, done, steps_taken, sub_obs).
+        
+        Args:
+            sub_positions: list of 1-indexed step positions [2, 4, 6] at which to collect intermediate obs.
+                           Only collected if not done at that step.
+        Returns:
+            (obs, reward, done, steps_taken, sub_obs)
+            sub_obs is a list of dicts (same format as obs), one per collected intermediate position.
+        """
+        if sub_positions is None:
+            sub_positions = []
         try:
-            _write_msg_sock(self._sock, {"cmd": "step_chunk", "actions": [a.tolist() for a in actions]})
+            _write_msg_sock(self._sock, {
+                "cmd": "step_chunk",
+                "actions": [a.tolist() for a in actions],
+                "sub_positions": sub_positions,
+            })
             resp = _read_msg_sock(self._sock, timeout=60)
         except (TimeoutError, RuntimeError, ConnectionError, socket.timeout):
             self._restart_worker()
             raise RuntimeError("Worker timed out during step_chunk, restarted")
         if resp.get("status") != "ok":
             raise RuntimeError(f"Worker error: {resp.get('message', 'unknown')}")
-        return _parse_obs(resp["obs"]), resp["reward"], resp["done"], resp["steps_taken"]
+        sub_obs = [_parse_obs(o) for o in resp.get("sub_obs", [])]
+        return _parse_obs(resp["obs"]), resp["reward"], resp["done"], resp["steps_taken"], sub_obs
 
     def close(self):
         if not self._closed:

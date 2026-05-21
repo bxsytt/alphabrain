@@ -36,19 +36,30 @@ from AlphaBrain.training.reinforcement_learning.common.rollout import _unnormali
 logger = logging.getLogger(__name__)
 
 
-def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_frames=False):
-    """Execute chunk_len env steps in ONE pipe round-trip (8x fewer I/Os)."""
+def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_frames=False,
+                    sub_positions=None):
+    """Execute chunk_len env steps in ONE pipe round-trip (8x fewer I/Os).
+    
+    Args:
+        sub_positions: list of 1-indexed step positions [2, 4, 6] at which to collect
+                       intermediate observations for chunk subsampling.
+    Returns:
+        (obs, reward, done, steps_taken, frames, sub_obs)
+        sub_obs: list of dicts (same format as obs), one per collected intermediate position.
+    """
+    if sub_positions is None:
+        sub_positions = []
     actions = [_postprocess_action(action_chunk_unnorm[step]) for step in range(chunk_len)]
     try:
-        obs, reward, done, steps_taken = env_pool.envs[env_idx].step_chunk(actions)
+        obs, reward, done, steps_taken, sub_obs = env_pool.envs[env_idx].step_chunk(actions, sub_positions)
     except RuntimeError as e:
         print(f"  [WARNING] env {env_idx} step_chunk failed: {e}, marking as done", flush=True)
         # Return a fake "failed" result — episode will be marked as failure
         obs = {"primary_image": np.zeros((256,256,3), dtype=np.uint8),
                "wrist_image": np.zeros((256,256,3), dtype=np.uint8),
                "state": np.zeros(8, dtype=np.float32)}
-        return obs, 0.0, True, 0, []
-    return obs, reward, done, steps_taken, []
+        return obs, 0.0, True, 0, [], []
+    return obs, reward, done, steps_taken, [], sub_obs
 
 
 def _env_dummy_steps(env_pool, env_idx, n_steps):
@@ -145,6 +156,10 @@ def action_token_collect_group_steplock(
     env_steps = [0] * G
     all_frames = [[] for _ in range(G)]  # video frames
 
+    # Chunk subsampling: stride-2 positions [2, 4, 6] for chunk_len=8
+    # sub_tokens 将在 stride position 2,4,6 采集（对应 sub_obs 索引 0,1,2）
+    _sub_positions = list(range(2, exec_chunk_len, 2))  # [2, 4, 6] for C=8
+
     max_chunks = max_steps // exec_chunk_len + 1
 
     # Timing accumulators
@@ -153,6 +168,7 @@ def action_token_collect_group_steplock(
     _t_store_records = 0.0
     _t_unnormalize = 0.0
     _t_env_step = 0.0
+    _t_sub_vla = 0.0      # sub_tokens VLA forward 耗时
     _t_total_chunks = 0
     _t_rollout_start = time.time()
 
@@ -223,7 +239,7 @@ def action_token_collect_group_steplock(
 
         # ── Store step records ──
         # 把刚刚在 GPU 里面由大模型（VLA）和强化学习网络（Actor-Critic）实时计算出来的各种高维张量（Tensor）
-        # “打包”并“搬运”到 CPU 内存中，像写日记一样，记录下当前时间步机器人的所有“所思所想”和“所作所为”
+        # "打包"并"搬运"到 CPU 内存中，像写日记一样，记录下当前时间步机器人的所有"所思所想"和"所作所为"
         _t0 = time.time()
         for i, g in enumerate(active_ids):
             sr = ActionTokenStepRecord(
@@ -260,19 +276,21 @@ def action_token_collect_group_steplock(
         # ── Step 4: All envs execute chunk in parallel ──
         _t0 = time.time()
         record_video = video_dir is not None
-        # 拿到了真正的物理动作后，再次启动 ThreadPoolExecutor 线程池
+        # 存储每个 env 的 sub_obs，供后续 sub_tokens 采集
+        sub_obs_by_env = {}
         with ThreadPoolExecutor(max_workers=len(active_ids)) as _pool:
             _futs = {}
             for i, g in enumerate(active_ids):
                 _futs[_pool.submit(
                     _env_step_chunk, env_pool, env_offset + g, action_chunks_unnorm[i],
-                    exec_chunk_len, record_video
+                    exec_chunk_len, record_video, _sub_positions
                 )] = (i, g)
             for _f in _as_completed(_futs):
                 i, g = _futs[_f]
-                obs, reward, done, steps_taken, frames = _f.result()
+                obs, reward, done, steps_taken, frames, sub_obs = _f.result()
                 obs_list[g] = obs
                 env_steps[g] += steps_taken
+                sub_obs_by_env[g] = sub_obs
                 if record_video:
                     all_frames[g].extend(frames)
                 if done or env_steps[g] >= max_steps:
@@ -287,11 +305,44 @@ def action_token_collect_group_steplock(
         _t_env_step += _t1 - _t0
         _t_total_chunks += 1
 
+        # ── Step 5: Batch VLA forward on sub_obs → populate sub_tokens ──
+        # Chunk subsampling: 在 stride-2 位置采集中间观测的 rl_token/vla_action
+        _t0 = time.time()
+        flat_sub = []
+        for g in active_ids:
+            sub_list = sub_obs_by_env.get(g, [])
+            for sub_idx, sub_o in enumerate(sub_list):
+                flat_sub.append((g, sub_idx, sub_o))
+        if flat_sub:
+            batch_sub_images = [[o["primary_image"], o["wrist_image"]] for _, _, o in flat_sub]
+            batch_sub_instrs = [task_descriptions[g] for g, _, _ in flat_sub]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                aq_sub, va_sub = frozen_vla.get_vla_action(
+                    batch_images=batch_sub_images, instructions=batch_sub_instrs)
+            rt_sub = encoder.encode(aq_sub)  # (N_sub, 1, D)
+            del aq_sub  # 显存优化
+            # Distribute back to each env's step_record.sub_tokens
+            for k, (g, sub_idx, sub_o) in enumerate(flat_sub):
+                step_record = episodes[g].step_records[-1]  # the record just appended
+                step_record.sub_tokens.append((
+                    rt_sub[k].cpu().squeeze(0),     # rl_token (1, D)
+                    va_sub[k].cpu(),                 # vla_action (C, A)
+                    torch.tensor(sub_o["state"]),    # prop_state
+                ))
+            del rt_sub
+            del va_sub
+            n_sub_total = len(flat_sub)
+            if n_sub_total > 0:
+                print(f"  [sub_tokens] collected {n_sub_total} sub_tokens across {len(active_ids)} envs "
+                      f"time={time.time()-_t0:.3f}s", flush=True)
+        _t_sub_vla += time.time() - _t0
+
         print(
             f"[TIMING] chunk {chunk_idx}: active={len(active_ids)} | "
             f"vla={_t_vla_forward/_t_total_chunks:.3f}s  enc+act={_t_encoder_actor/_t_total_chunks:.3f}s  "
             f"store={_t_store_records/_t_total_chunks:.3f}s  unnorm={_t_unnormalize/_t_total_chunks:.3f}s  "
             f"env_step={_t_env_step/_t_total_chunks:.3f}s  "
+            f"sub_vla={_t_sub_vla/_t_total_chunks:.3f}s  "
             f"chunk_total={time.time()-_t_chunk_start:.3f}s"
         )
 
@@ -321,6 +372,7 @@ def action_token_collect_group_steplock(
     # ── Timing summary ──
     _t_rollout_total = time.time() - _t_rollout_start
     if _t_total_chunks > 0:
+        _sum = _t_vla_forward + _t_encoder_actor + _t_store_records + _t_unnormalize + _t_env_step + _t_sub_vla
         print(
             f"\n[TIMING SUMMARY] rollout group {group_idx} | G={G} | {_t_total_chunks} chunks | total={_t_rollout_total:.2f}s\n"
             f"  vla_forward:    {_t_vla_forward:.2f}s ({100*_t_vla_forward/_t_rollout_total:.1f}%)  avg={_t_vla_forward/_t_total_chunks:.3f}s/chunk\n"
@@ -328,7 +380,8 @@ def action_token_collect_group_steplock(
             f"  store_records:  {_t_store_records:.2f}s ({100*_t_store_records/_t_rollout_total:.1f}%)  avg={_t_store_records/_t_total_chunks:.3f}s/chunk\n"
             f"  unnormalize:    {_t_unnormalize:.2f}s ({100*_t_unnormalize/_t_rollout_total:.1f}%)  avg={_t_unnormalize/_t_total_chunks:.3f}s/chunk\n"
             f"  env_step:       {_t_env_step:.2f}s ({100*_t_env_step/_t_rollout_total:.1f}%)  avg={_t_env_step/_t_total_chunks:.3f}s/chunk\n"
-            f"  other/overhead: {_t_rollout_total - _t_vla_forward - _t_encoder_actor - _t_store_records - _t_unnormalize - _t_env_step:.2f}s"
+            f"  sub_vla:        {_t_sub_vla:.2f}s ({100*_t_sub_vla/_t_rollout_total:.1f}%)  avg={_t_sub_vla/_t_total_chunks:.3f}s/chunk\n"
+            f"  other/overhead: {_t_rollout_total - _sum:.2f}s"
         )
 
     # ── Finalize episodes ──
@@ -435,8 +488,12 @@ def action_token_collect_multitask_steplock(
     env_steps = [0] * total_G
     max_chunks = max_steps // exec_chunk_len + 1
 
+    # Chunk subsampling: stride-2 positions [2, 4, 6] for chunk_len=8
+    _sub_positions = list(range(2, exec_chunk_len, 2))  # [2, 4, 6] for C=8
+
     _t_vla = 0.0
     _t_env = 0.0
+    _t_sub_vla = 0.0
     _n_chunks = 0
 
     for chunk_idx in range(max_chunks):
@@ -502,16 +559,18 @@ def action_token_collect_multitask_steplock(
 
         # ── ALL envs execute chunk in parallel ──
         _t0 = time.time()
+        sub_obs_by_env = {}
         with ThreadPoolExecutor(max_workers=len(active_ids)) as _pool:
             _futs = {}
             for i, g in enumerate(active_ids):
                 _futs[_pool.submit(_env_step_chunk, env_pool, g, action_chunks_unnorm[i],
-                                   exec_chunk_len, False)] = (i, g)
+                                   exec_chunk_len, False, _sub_positions)] = (i, g)
             for _f in _as_completed(_futs):
                 i, g = _futs[_f]
-                obs, reward, done, steps_taken, _ = _f.result()
+                obs, reward, done, steps_taken, _, sub_obs = _f.result()
                 obs_list[g] = obs
                 env_steps[g] += steps_taken
+                sub_obs_by_env[g] = sub_obs
                 if done or env_steps[g] >= max_steps:
                     active[g] = False
                     ep = episodes[g]
@@ -522,6 +581,32 @@ def action_token_collect_multitask_steplock(
                     ep.env_steps = env_steps[g]
         _t_env += time.time() - _t0
         _n_chunks += 1
+
+        # ── Batch VLA forward on sub_obs → populate sub_tokens ──
+        _t0 = time.time()
+        flat_sub = []
+        for g in active_ids:
+            sub_list = sub_obs_by_env.get(g, [])
+            for sub_idx, sub_o in enumerate(sub_list):
+                flat_sub.append((g, sub_idx, sub_o))
+        if flat_sub:
+            batch_sub_images = [[o["primary_image"], o["wrist_image"]] for _, _, o in flat_sub]
+            batch_sub_instrs = [task_descriptions[g] for g, _, _ in flat_sub]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                aq_sub, va_sub = frozen_vla.get_vla_action(
+                    batch_images=batch_sub_images, instructions=batch_sub_instrs)
+            rt_sub = encoder.encode(aq_sub)
+            del aq_sub
+            for k, (g, sub_idx, sub_o) in enumerate(flat_sub):
+                step_record = episodes[g].step_records[-1]
+                step_record.sub_tokens.append((
+                    rt_sub[k].cpu().squeeze(0),
+                    va_sub[k].cpu(),
+                    torch.tensor(sub_o["state"]),
+                ))
+            del rt_sub
+            del va_sub
+        _t_sub_vla += time.time() - _t0
 
         # ── 显存优化：每5个chunk清理一次PyTorch缓存分配器 ──
         # QwenVL forward (output_hidden_states=True) 每次产生 ~290MB 中间隐状态。
@@ -551,6 +636,6 @@ def action_token_collect_multitask_steplock(
     if _n_chunks > 0:
         print(f"[MULTITASK TIMING] {n_tasks} tasks × {G_per_task} eps = {total_G} total | "
                      f"{_n_chunks} chunks | vla={_t_vla:.1f}s env={_t_env:.1f}s "
-                     f"total={_t_vla+_t_env:.1f}s")
+                     f"sub_vla={_t_sub_vla:.1f}s total={_t_vla+_t_env+_t_sub_vla:.1f}s")
 
     return episodes

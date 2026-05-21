@@ -103,11 +103,11 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --actor_update_freq 2 \
     --target_noise_std 0.2 \
     --target_noise_clip 0.5 \
-    --max_iter 400 \
+    --max_iter 200 \
     --eval_interval 20 \
     --eval_n_episodes 20 \
-    --save_interval 50 \
-    --save_video_interval 100 \
+    --save_interval 20 \
+    --save_video_interval 20 \
     --seed 42 \
     --use_wandb \
     --wandb_project AlphaBrain_RLT \

@@ -26,7 +26,7 @@ LIBERO_ENV_RESOLUTION = 256
 MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object":  280,
-    "libero_goal":    16,   # debug: 16 steps → 2 chunks (was 320 → 40 chunks)
+    "libero_goal":    320,   # debug: 16 steps → 2 chunks (was 320 → 40 chunks)
     "libero_10":      520,
     "libero_90":      400,
 }
@@ -171,12 +171,17 @@ def main():
 
             elif cmd == "step_chunk":
                 actions = msg["actions"]
+                sub_positions = msg.get("sub_positions", [])  # e.g., [2, 4, 6]
                 final_reward = 0.0
                 final_done = False
                 steps_taken = 0
+                sub_obs = []  # intermediate observations at stride positions
                 for a in actions:
                     obs, reward, done, info = env.step(a)
                     steps_taken += 1
+                    # Collect intermediate obs at stride positions (before done triggers)
+                    if steps_taken in sub_positions and not done:
+                        sub_obs.append(_parse_obs(obs))
                     if done:
                         final_done = True
                         final_reward = float(reward)
@@ -189,6 +194,7 @@ def main():
                     "reward": final_reward,
                     "done": final_done,
                     "steps_taken": steps_taken,
+                    "sub_obs": sub_obs,
                 })
 
             elif cmd == "close":

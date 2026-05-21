@@ -1000,6 +1000,11 @@ def run_rl_offpolicy(args):
                     if args.max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
                     optimizer_actor.step()
+                    """
+                    target_q_critic 用于计算 TD target（Eq.3 中的 Q̂），如果直接用在线 Q 网络来计算 target，
+                    会导致 Q 值被高估（overestimation bias）——因为网络会倾向于对自己预测高的动作给出更高的评价，
+                    形成自举恶性循环。目标网络作为 "慢速追赶" 的版本，永远滞后于在线网络，让 TD target 的计算更稳定
+                    """
                     soft_update_target(q_critic, target_q_critic, tau=args.tau)
                     soft_update_target(actor, target_actor, tau=args.tau)
 
