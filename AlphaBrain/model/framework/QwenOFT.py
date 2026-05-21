@@ -270,6 +270,7 @@ class Qwenvl_OFT(BaseFramework):
         last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
         input_ids = qwen_inputs.get("input_ids", None)
+        # QwenOFT 从末尾 <action> token 位置提取
         action_queries = self._gather_action_token_embeddings(
             last_hidden, input_ids, action_token_id=self.action_token_id
         )

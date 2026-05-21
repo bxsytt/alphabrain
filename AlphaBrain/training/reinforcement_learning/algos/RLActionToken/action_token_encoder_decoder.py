@@ -95,13 +95,13 @@ class ActionTokenEncoder(nn.Module):
         Returns:
             rl_token: (B, 1, D_bottleneck)
         """
-        action_queries = action_queries.float()
+        action_queries = action_queries.float()              # [5, 8, 2048]
         B = action_queries.size(0)
         cls = self.cls_token.expand(B, -1, -1)               # (B, 1, H)
         seq = torch.cat([action_queries, cls], dim=1)         # (B, M+1, H)
         for layer in self.self_attn_layers:
-            seq = layer(seq)                                  # (B, M+1, H)
-        rl_token = self.bottleneck_proj(seq[:, -1:, :])       # (B, 1, D)
+            seq = layer(seq)                                  # (B, M+1, H)   (5,9,2048)
+        rl_token = self.bottleneck_proj(seq[:, -1:, :])       # (B, 1, D)     (5,1,256)
         return rl_token
 
 """
@@ -187,7 +187,7 @@ class ActionTokenDecoder(nn.Module):
             # Target:   [z_1,  z_2,     z_3,     ...,  z_M        ]
             # Shifted input: z_rl is position 0, z_1 is position 1, etc.
             shifted_input = target_tokens[:, :-1, :].detach()  # (B, M-1, H)
-            seq = torch.cat([prefix, shifted_input], dim=1)    # (B, M, H)
+            seq = torch.cat([prefix, shifted_input], dim=1)    # (B, M, H)[5, 8, 2048]=[5, 1, 2048]+[5, 7, 2048]
             seq = seq + self.pos_embed                         # add positional info
         else:
             # Inference: use positional embeddings (no teacher forcing)
@@ -207,7 +207,7 @@ class ActionTokenDecoder(nn.Module):
             seq = layer(seq, src_mask=causal_mask, is_causal=True)
 
         # 在序列的每一个位置 i，输出的向量就是对目标动作 Token z_i 的预测
-        return seq  # (B, M, H) — each position predicts the corresponding target
+        return seq  # [5, 8, 2048]     (B, M, H) — each position predicts the corresponding target
 
 
 """
@@ -274,9 +274,10 @@ class ActionTokenEncoderDecoder(nn.Module):
             rl_token: (B, 1, D)
             recon_loss: scalar MSE reconstruction loss
         """
-        action_queries = action_queries.float()
-        rl_token = self.encoder(action_queries)
+        action_queries = action_queries.float()         # [5, 8, 2048]
+        rl_token = self.encoder(action_queries)         # [5, 1, 256]
         # Autoregressive decode with teacher forcing
+        # 模型需要根据 rl_token，重新构建（Reconstruct）出原始、完整的 VLM 动作特征序列（即 action_queries）
         reconstructed = self.decoder(rl_token, target_tokens=action_queries.detach())
         # 自回归重构的 MSE 损失，迫使 rl_token 瓶颈保留足够多的原始 VLA 信息
         recon_loss = F.mse_loss(reconstructed, action_queries.detach())

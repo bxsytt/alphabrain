@@ -25,9 +25,9 @@ def run_pretrain(args):
 
     # Load frozen VLA
     logger.info(f"Loading frozen VLA from {args.ckpt_path}")
-    frozen_vla = BaseFramework.from_pretrained(args.ckpt_path)
+    frozen_vla = BaseFramework.from_pretrained(args.ckpt_path)      # 冻结VLA
     frozen_vla = frozen_vla.to(torch.bfloat16).to(device).eval()
-    for param in frozen_vla.parameters():
+    for param in frozen_vla.parameters():                           # 完全冻结
         param.requires_grad_(False)
 
     # hidden_dim = frozen_vla.qwen_vl_interface.model.config.hidden_size
@@ -105,9 +105,8 @@ def run_pretrain(args):
         )
 
     # Phase 1b: Batch-extract all action_queries via frozen VLA (one-time GPU work)
-    # 用 冻结的 frozen VLA 把收集到的原始观测 批量送入 VLA 做一次前向推理，提取出 action token 位置处的
-    # 隐藏状态序列（action_queries）→ 得到 (N, chunk_len, hidden_dim) 的张量。
-    # 结束后立即释放 VLA 模型
+    # Phase 1 预训练时，先用随机策略收集大量原始观测（图像+指令）缓冲到 observations 列表，然后一次性
+    # batch VLA forward 提取出 all_queries 张量（缓存在 GPU 上），最后用这些缓存数据反复训练 encoder-decoder
     logger.info(f"Extracting action_queries from {len(observations)} observations (batch VLA forward)...")
     all_queries = extract_action_queries_from_obs(
         frozen_vla=frozen_vla,

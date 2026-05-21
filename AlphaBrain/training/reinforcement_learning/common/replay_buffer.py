@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 
-# 所有经验存入容量 1M 的环形 buffer，可被重复采样
+# 存储 warmup阶段 off-policy采集的和 TD3 训练的 transition (s, a, r, s')，容量 100K~1M
 class ReplayBuffer:
     """Fixed-capacity ring buffer for off-policy experience replay."""
 

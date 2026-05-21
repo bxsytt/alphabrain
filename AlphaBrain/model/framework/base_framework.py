@@ -93,6 +93,7 @@ class BaseFramework(PreTrainedModel):
         
         super().__init__(hf_config)
 
+    # 根据给定的路径，把一个“训练好”的模型从硬盘里“复活”到内存中
     @classmethod
     def from_pretrained(
         cls,

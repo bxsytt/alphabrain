@@ -398,6 +398,9 @@ class Qwen_GR00T(BaseFramework):
 
         return future_frames
 
+    """
+    将非结构化的多模态输入（图像+指令）转化为下游 RL（强化学习）策略能够理解的、固定长度的“动作查询特征”
+    """
     @torch.inference_mode()
     def get_action_queries(
         self,

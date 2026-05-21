@@ -229,7 +229,7 @@ def _parse_obs(obs_raw: dict) -> dict:
 MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object":  280,
-    "libero_goal":    320,
+    "libero_goal":    16,   # debug: 16 steps → 2 chunks (was 320 → 40 chunks)
     "libero_10":      520,
     "libero_90":      400,
 }

@@ -200,13 +200,14 @@ class BatchInferenceServer:
 class ActionTokenStepRecord:
     """One inference step during RLActionToken rollout."""
     rl_token: torch.Tensor        # (1, D) detached cpu
-    vla_action: torch.Tensor      # (chunk_len, action_dim) detached cpu
-    action_taken: torch.Tensor    # (chunk_len, action_dim) detached cpu
+    vla_action: torch.Tensor      # VLA 模型输出的参考动作 (chunk_len, action_dim)
+    action_taken: torch.Tensor    # 实际执行的动作（可能经过加噪/扰动）(chunk_len, action_dim)
     old_log_prob: float
     value: float = 0.0
-    prop_state: Optional[torch.Tensor] = None  # (prop_dim,) proprioceptive at chunk start
+    prop_state: Optional[torch.Tensor] = None  # 当前本体感受（关节位置、夹爪开合等）(prop_dim,)
     # Chunk subsampling: intermediate VLA inference results at stride positions [2,4,6]
     # Each element: (rl_token (1,D), vla_action (C,A), prop_state (prop_dim,))
+    # Chunk 内部中间位置 [2, 4, 6] 的 (rl_token, vla_action, prop_state) 缓存
     sub_tokens: list = field(default_factory=list)
     # Optional: store raw images for VLA full fine-tune (re-encode during training)
     images: Optional[list] = None         # [primary_img, wrist_img] numpy arrays
@@ -215,11 +216,12 @@ class ActionTokenStepRecord:
 
 @dataclass
 class ActionTokenEpisode:
+    # step_records: 该轨迹包含的所有时间步（每个时间步 = 一个执行块 Chunk）
     step_records: List[ActionTokenStepRecord] = field(default_factory=list)
     reward: float = 0.0
     task_id: int = 0
     success: bool = False
-    finish_step: int = 0
+    finish_step: int = 0        # 轨迹结束时的步数（Chunk 个数）
     env_steps: int = 0          # total env.step() calls (excluding wait steps)
     done_cache_idx: int = -1    # cache_idx at termination (within last chunk); step = idx-1
     video_path: Optional[str] = None
@@ -451,6 +453,7 @@ def _action_token_rollout_one(
     current_sr: Optional[ActionTokenStepRecord] = None
 
     # Stride positions within a chunk for subsampling (paper: stride=2)
+    # sub_tokens 在 position 2,4,6 采集
     _sub_positions = set(range(2, chunk_len, 2))  # {2, 4, 6} for chunk_len=8
 
     while env_step < max_steps + num_steps_wait:
@@ -797,11 +800,13 @@ def action_token_ppo_loss(
     }
     return loss, stats
 
-
 # ------------------------------------------------------------------
 # Off-policy: Push episodes to replay buffer
 # ------------------------------------------------------------------
 
+# 将RL Token 论文风格下机器人采集到的完整轨迹（Episodes）"揉碎"成强化学习算法（Critic 网络）
+# 训练所需的(s, a, r, s', done)四元组（Transitions），然后存入离线经验回放缓冲区 ReplayBuffer 中，
+# 供后续的 off-policy TD3 风格训练使用
 def push_episodes_to_buffer(
     episodes: List[ActionTokenEpisode],
     replay_buffer: ReplayBuffer,
@@ -825,8 +830,31 @@ def push_episodes_to_buffer(
         reward = γ^(d-p) * episode_reward   (discounted by steps from p to done)
 
     Reward scheme: success=1.0, failure=0.0 (paper scheme)
+
+            ┌─────────────────────────────────────────────────────────┐
+        │  第1层: for ep in episodes     ← 遍历每条轨迹           │
+        │  ┌───────────────────────────────────────────────────┐  │
+        │  │  第2层: for t in range(n)   ← 遍历轨迹内每个Chunk │  │
+        │  │  ┌─────────────────────────────────────────────┐  │  │
+        │  │  │  第3层: for p in [0,2,4,6] ← Chunk内步长2采样│  │  │
+        │  │  └─────────────────────────────────────────────┘  │  │
+        │  └───────────────────────────────────────────────────┘  │
+        └─────────────────────────────────────────────────────────┘
+        假设有一个 Chunk 大小为 8 的轨迹，finish_step = 3（3 个 Chunk），
+        done_cache_idx = 6（在最后一个 Chunk 的位置 5 终止），成功奖励 reward = 1.0。
+
+        Chunk 0 (非终止):  stride_positions = [0, 2, 4, 6] → 产生 4 条 transitions, done=False, reward=0.0
+        Chunk 1 (非终止):  stride_positions = [0, 2, 4, 6] → 产生 4 条 transitions, done=False, reward=0.0
+        Chunk 2 (终止):    done_step = 5
+        p=0 → γ^(5-0)=0.99^5 ≈ 0.951, done=True
+        p=2 → γ^(5-2)=0.99^3 ≈ 0.970, done=True
+        p=4 → γ^(5-4)=0.99^1 ≈ 0.990, done=True--->位置越靠近终止步，折扣越少 → 奖励越高，有助于 Credit Assignment
+        p=6 → p > done_step(5) → break (跳过)
+        → 产生 3 条 transitions
+        总计：4 + 4 + 3 = 11 条 transitions。
     """
     n_pushed = 0
+    # 1. 第一层 for ep in episodes：遍历每一个独立的尝试（轨迹）
     for ep in episodes:
         steps = ep.step_records
         n = ep.finish_step
@@ -834,6 +862,7 @@ def push_episodes_to_buffer(
             continue
 
         # Infer chunk_len from first step record
+        # 将一个 Chunk 扩展为 4 条 transitions，大大增加训练样本量
         chunk_len = steps[0].action_taken.shape[0]
         stride = 2
         stride_positions = list(range(0, chunk_len, stride))  # [0, 2, 4, 6] for C=8
@@ -841,12 +870,16 @@ def push_episodes_to_buffer(
         # Terminal step within last chunk (0-based): done_cache_idx was set after +1
         done_step = max(0, ep.done_cache_idx - 1) if ep.done_cache_idx >= 0 else chunk_len - 1
 
+        #2. 第二层 for t in range(n)：遍历该轨迹下的每一个时间步（每个时间步包含一个执行块 Chunk）
         for t in range(n):
             s = steps[t]
-            is_last = (t == n - 1)
+            # is_last 标记是否为轨迹的最后一个 Chunk（即与环境交互结束的 Chunk）
+            # 只有最后一个 Chunk 的 done = True，其他 Chunk 的 done = False
+            is_last = (t == n - 1)    
             done = is_last
             s_next = steps[t + 1] if not is_last else None
 
+            #3. 第三层 ：在当前 Chunk 内部，按步长 stride=2（即位置 0, 2, 4, 6）进行细粒度采样
             for pos_idx, p in enumerate(stride_positions):
                 # ── Terminal chunk: skip stride positions beyond the done step ──
                 if is_last and p > done_step:
@@ -857,7 +890,7 @@ def push_episodes_to_buffer(
                     rl_tok = s.rl_token
                     vla_act = s.vla_action
                     prop = s.prop_state
-                else:
+                else:                  # 从 s.sub_tokens 中取对应的 sub_tokens[pos_idx - 1]
                     sub_idx = pos_idx - 1  # sub_tokens index (0→pos2, 1→pos4, 2→pos6)
                     if sub_idx >= len(s.sub_tokens):
                         # Episode ended before position p within this chunk; skip
@@ -867,7 +900,7 @@ def push_episodes_to_buffer(
                 # ── Action: cross-chunk slice of length C ──
                 if p == 0:
                     action = s.action_taken  # full chunk, no slicing needed
-                else:
+                else:                         # 将当前 Chunk 的尾部 + 下个 Chunk 的头部拼接：
                     tail = s.action_taken[p:]           # (C-p, A)
                     if s_next is not None:
                         head = s_next.action_taken[:p]  # (p, A)
@@ -878,22 +911,25 @@ def push_episodes_to_buffer(
                     action = torch.cat([tail, head], dim=0)  # (C, A)
 
                 # ── Reward (paper Eq. 3): discounted within-chunk reward ──
-                if is_last and ep.reward != 0.0:
+                # 稀疏奖励，只有最后一个 Chunk + 成功，奖励值才会是 stride_reward
+                if is_last and ep.reward != 0.0:     
                     # Sparse reward at terminal step: γ^(done_step - p) * R
+                    # 折扣使靠近终止的位置获得更高奖励，有助于 Credit Assignment
                     stride_reward = (gamma_per_step ** (done_step - p)) * ep.reward
                 else:
                     stride_reward = 0.0
 
                 # ── Next state at position p ──
-                if is_last:
+                # 为了让 Critic 能够计算目标值（Target），必须知道下一个状态是什么：
+                if is_last:             # 如果当前是最后一个块，下一状态直接全部用 zeros_like 掩码清零，表示终止状态
                     next_rl_tok = torch.zeros_like(rl_tok)
                     next_vla_act = torch.zeros_like(vla_act)
                     next_prop = torch.zeros_like(prop) if prop is not None else None
-                elif p == 0:
+                elif p == 0:           # 如果位置p=0，下一状态就是下一个块的头部
                     next_rl_tok = s_next.rl_token
                     next_vla_act = s_next.vla_action
                     next_prop = s_next.prop_state
-                else:
+                else:                  # 如果位置 p>0，取 s_next.sub_tokens[pos_idx - 1]（下个 Chunk 内部的子位置）
                     sub_idx = pos_idx - 1
                     if sub_idx >= len(s_next.sub_tokens):
                         # Next chunk doesn't have sub_token at position p (ended early)
@@ -901,18 +937,19 @@ def push_episodes_to_buffer(
                         break
                     next_rl_tok, next_vla_act, next_prop = s_next.sub_tokens[sub_idx]
 
+                # 将组装好的高维张量统统塞进 replay_buffer
                 replay_buffer.push(
-                    rl_token=rl_tok,
-                    vla_action=vla_act,
-                    action_taken=action,
-                    reward=stride_reward,
-                    next_rl_token=next_rl_tok,
-                    next_vla_action=next_vla_act,
-                    done=done,
-                    task_id=ep.task_id,
-                    prop_state=prop,
-                    next_prop_state=next_prop,
-                    from_success=(ep.reward > 0.5),
+                    rl_token=rl_tok,                  # 当前状态
+                    vla_action=vla_act,               # vla参考动作
+                    action_taken=action,              # vla实际执行的动作
+                    reward=stride_reward,             # 折扣后的奖励
+                    next_rl_token=next_rl_tok,        # 下一状态
+                    next_vla_action=next_vla_act,     # 下一状态vla参考动作
+                    done=done,                        # 是否结束的标志
+                    task_id=ep.task_id,               # 任务id
+                    prop_state=prop,                  # 本体感受状态
+                    next_prop_state=next_prop,        # 下一时刻本体感受
+                    from_success=(ep.reward > 0.5),   # 一个标记是否来自成功轨迹的布尔值
                 )
                 n_pushed += 1
     return n_pushed
@@ -1007,15 +1044,17 @@ def vla_finetune_step(
     }
     return stats
 
-
 # ------------------------------------------------------------------
 # Off-policy TD update (RL Token paper style: TD3 twin-Q + DDPG actor)
 # ------------------------------------------------------------------
-
+"""
+ TD3（Twin Delayed DDPG）风格的 Critic（Q 网络）更新，对应论文中的 Eq.3。
+ 它的核心任务是从经验回放缓冲区采样一批数据，计算 TD target，然后用 MSE loss 更新 twin-Q 网络的参数
+"""
 def action_token_td_critic_update(
-    actor: ActionTokenActor,
-    q_critic: ActionTokenQCritic,
-    target_q_critic: ActionTokenQCritic,
+    actor: ActionTokenActor,         # 在线 Actor 网络（仅在 target_actor=None 时用作 fallback 生成 next action）
+    q_critic: ActionTokenQCritic,    # 在线 twin-Q 网络（参数会通过 loss 反向传播更新）
+    target_q_critic: ActionTokenQCritic,   # 目标 twin-Q 网络（Polyak 滑动平均更新，不直接计算梯度）
     replay_buffer: ReplayBuffer,
     batch_size: int = 256,
     gamma: float = 0.99,
@@ -1042,36 +1081,40 @@ def action_token_td_critic_update(
         critic_loss: scalar tensor (with grad on q_critic params)
         stats: dict
     """
-    if n_tasks > 0:
+    if n_tasks > 0:   # 调用 sample_balanced，按任务分层采样，确保每个任务在 batch 中都有足够的样本，避免任务不平衡导致的训练偏差
         rl_tok, vla_act, act_taken, rew, next_rl_tok, next_vla_act, done, prop, next_prop = \
             replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device,
                                           success_weight=success_weight)
-    else:
+    else:   # 直接调用 sample,success_weight > 2.0 时，成功 transition 被更高概率采样，缓解稀疏奖励问题。
         rl_tok, vla_act, act_taken, rew, next_rl_tok, next_vla_act, done, prop, next_prop = \
             replay_buffer.sample(batch_size, device=device, success_weight=success_weight)
 
     # ── Target Q value (TD3: target policy smoothing + min of twin Q) ──
     with torch.no_grad():
         # Next action from target actor (TD3) + smoothing noise
+        # 先让目标 Actor 预测下一步的动作，然后给这个动作加上裁剪过的高斯噪声
         _actor_for_target = target_actor if target_actor is not None else actor
         next_action, _ = _actor_for_target(next_rl_tok, next_vla_act, next_prop, deterministic=True)
         # TD3 target policy smoothing: add clipped noise to target actions
+        # 为什么要加噪声？ 防止 Q 函数产生不平滑的“尖峰”。通过在动作周围加点震荡，
+        # 迫使 Q 函数学会在一个小邻域内都是平滑的，这样 Actor 就不容易钻空子去选择那些被高估的极端动作
         noise = torch.randn_like(next_action) * target_noise_std
         noise = noise.clamp(-target_noise_clip, target_noise_clip)
         next_action = (next_action + noise).clamp(-1.0, 1.0)
 
         # Target Q with min of twin Q (paper: Eq.3)
         tq1, tq2 = target_q_critic(next_rl_tok, next_action, next_prop)
-        next_q = torch.min(tq1, tq2)  # (B,)
+        next_q = torch.min(tq1, tq2)  # (B,)   取 min(tq1, tq2) 作为下一状态的 Q 估计, 有效解决了 Q 学习中的高估偏差问题
         target = rew + gamma * next_q * (1.0 - done)
         # Clip to theoretical upper bound (paper reward: success=1, so Q ≤ 1/(1-γ)).
         # Prevents bootstrap overestimation from runaway positive Q values.
         # Clip to theoretical upper bound: max_reward / (1 - gamma)
         # With reward_coef=5, gamma=0.99 → upper bound = 500. Use reward_coef as safe proxy.
         q_upper = max(1.0, rew.abs().max().item() * 2) if rew.numel() > 0 else 1.0
-        target = target.clamp(max=q_upper)
+        target = target.clamp(max=q_upper)    # 逆向裁剪了一个自适应上界, 防止 bootstrap 过程中 Q 值无限膨胀
 
     # ── Online Q loss ──
+    # 在线的 q1 和 q2 分别去预测当前状态和动作的 Q 值
     q1, q2 = q_critic(rl_tok, act_taken, prop)
     critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
 
@@ -1083,7 +1126,10 @@ def action_token_td_critic_update(
     }
     return critic_loss, stats
 
-
+"""
+实现了 DDPG 风格的 Actor（策略网络）更新，对应 RL Token 论文中的 Eq.5。它的任务是从回放缓冲区采样状态，
+让 Actor 输出动作，然后用 Q 值引导 + BC 正则化 的组合 loss 来更新 Actor 的参数
+"""
 def action_token_td_actor_update(
     actor: ActionTokenActor,
     q_critic: ActionTokenQCritic,
@@ -1111,6 +1157,7 @@ def action_token_td_actor_update(
         actor_loss: scalar tensor (with grad on actor params)
         stats: dict
     """
+    # Actor 的更新是 on-policy 风格的：它只需要当前状态的 Q 值来引导策略方向，不需要 TD target
     if n_tasks > 0:
         rl_tok, vla_act, _, _, _, _, _, prop, _ = \
             replay_buffer.sample_balanced(batch_size, n_tasks=n_tasks, device=device,
@@ -1120,15 +1167,23 @@ def action_token_td_actor_update(
             replay_buffer.sample(batch_size, device=device, success_weight=success_weight)
 
     # Paper Eq. 5: a ~ π_θ (stochastic rsample for correct gradient)
-    action, _ = actor(rl_tok, vla_act, prop, deterministic=False)
+    action, _ = actor(rl_tok, vla_act, prop, deterministic=False)   # [8,1,256][8,8,7][8,8]--->[8,8,7]
 
     # Q-value of the sampled action (only Q1 for efficiency, as in TD3)
+        # 只计算 Q1，不计算 Q2
+        # 这是 TD3 的实践：Actor 更新时只需要一个 Q 的梯度方向，不需要 min 操作
+        # Q2 仅在 Critic update 的 target 计算中使用
+        # 节省约 50% 的 Critic 前向计算量
     q_val = q_critic.q1_forward(rl_tok, action, prop)  # (B,)
 
     # BC regularization: ‖a - ã‖² (anchor to VLA reference)
+    # 当前 Actor 输出与 VLA 参考动作的差
     bc_penalty = ((action - vla_act) ** 2).sum(dim=(-2, -1)).mean()  # scalar
 
     # Paper Eq. 5: minimize -Q + β * BC
+    # 最大化 Q 值（负号转最小化）---> 让动作朝着能获得高回报的方向调整
+    # BC 正则化（约束到 VLA 参考附近） ---> 防止动作偏离 VLA 参考太远，保持行为克隆的稳定性
+    # BC 正则化提供一个"安全锚点"：VLA 参考动作 是从大规模预训练数据中学习的合理动作，BC 项确保 Actor 不会偏离太远。Q 项则负责微调，让动作朝更高回报的方向偏移。
     actor_loss = -q_val.mean() + beta * bc_penalty
 
     stats = {

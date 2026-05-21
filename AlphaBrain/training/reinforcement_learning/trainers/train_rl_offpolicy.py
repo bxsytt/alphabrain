@@ -17,6 +17,7 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -128,6 +129,8 @@ def run_rl_offpolicy(args):
         args._selected_task_ids = None
 
     # ── Create trainable modules on train_gpu ────────────
+    # 唯一的参数源（source of truth），只有在 BC Pretrain 或 VLA fine-tune 时才接收梯度（正常情况下冻结）
+    # 主线程中的 TD3 更新只使用 actor 和 q_critic，不直接使用 enc_dec（除非 VLA fine-tune）
     enc_dec = ActionTokenEncoderDecoder(
         input_dim=hidden_dim,
         bottleneck_dim=args.bottleneck_dim,
@@ -263,7 +266,7 @@ def run_rl_offpolicy(args):
         eval_modules[gpu_id] = (e_enc, e_actor)
 
     # ── Per-GPU rollout infrastructure ──
-    if args.use_steplock:
+    if args.use_steplock:     # True
         # Step-lock mode: persistent env pools (no BatchInferenceServer needed)
         from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import PersistentEnvPool
         from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_rollout_fast import (
@@ -379,14 +382,14 @@ def run_rl_offpolicy(args):
     # run on the main thread (train GPU). This matches the PI paper's
     # asynchronous rollout + learning design.
 
-    buffer_lock = threading.Lock()
+    buffer_lock = threading.Lock()        # protects push_eps_to_buffer and replay_buffer.sample 
     rollout_stats_queue = queue.Queue()   # (episodes, iteration)
     _stop_rollout = threading.Event()
     _weight_sync_lock = threading.Lock()  # protects weight copy (non-blocking)
 
-    # 数据收集与训练完全异步，rollout 使用的总是陈旧权重（每 500 步才同步一次）
-    # train_rl_offpolicy.py的 792：   sync_every_n_updates = 500 
-    # 把 train GPU 上的 actor/encoder/critic 权重拷贝到所有 rollout GPU 上
+    # 将 train GPU 上的 actor、enc_dec（编码器）、dummy_critic 的最新权重拷贝到所有 rollout GPU 的模块副本中
+    # 这样 rollout 线程拿到的模型参数虽然不是实时的，但每隔一定步数（500步）更新一次，让 rollout 用"比较新的旧权重"去收集数据。
+    # 关键优化：先用 state_dict() 把权重拉到 CPU 上，再批量 copy 到各个 GPU，避免重复序列化开销。
     def _sync_rollout_weights():
         """Copy latest actor/encoder weights to all rollout GPU copies (in-place, no temp GPU tensors).
 
@@ -444,6 +447,12 @@ def run_rl_offpolicy(args):
     _eval_thread_holder = [None]  # mutable holder so closures can update
     _eval_lock = threading.Lock()  # ensures only one eval at a time
 
+    """
+    将最新的 actor 和 enc_dec 权重拷贝到专用的 eval 模块副本（eval_modules，与 rollout_modules 分离，避免竞争）
+    与 _sync_rollout_weights 的区别：
+        只同步 encoder 和 actor，不同步 critic（eval 不需要 critic）
+        目标设备是 eval_modules 而非 rollout_modules
+    """
     def _sync_eval_weights():
         """Copy latest train weights to eval modules (in-place, no temp GPU tensors)."""
         with _weight_sync_lock:
@@ -470,6 +479,11 @@ def run_rl_offpolicy(args):
         for gpu_id in rollout_gpu_ids:
             torch.cuda.synchronize(f"cuda:{gpu_id}")
 
+    """
+    评估的实际干活函数。它用多个 rollout GPU 并行跑 _eval_deterministic_local（通过 ThreadPoolExecutor），
+    在仿真环境里运行若干条 episode，计算每个任务的 Success Rate（成功率），最后返回一个结果字典（包含 eval_sr、per_task_eval_sr 等）。
+    这个函数只在后台线程中调用（不会直接在主线程调用），所以叫 "inline" 意思是它包含了评估的"内联逻辑体"。
+    """
     def _run_eval_inline(iteration, save_video):
         """Synchronous eval body — same logic as before but uses eval_modules.
 
@@ -612,6 +626,13 @@ def run_rl_offpolicy(args):
             "per_task_eval_sr": per_task_eval_sr_local,
         }
 
+    """
+    异步 eval 的线程入口函数。包装 _run_eval_inline 在后台线程中运行，结果通过 _eval_results_queue 异步返回给主线程
+    设计理由：
+        Eval 通常需要运行很多 episode（比如每个任务 20 个），耗时较长
+        如果放在主线程中会阻塞 rollout 和 TD3 训练
+        异步 eval 使得主线程可以继续处理 rollout 数据和 TD3 更新，eval 结果在后台到达
+    """
     def _async_eval_fn(iteration, save_video):
         """Background thread target: run eval, push result to queue."""
         try:
@@ -623,6 +644,15 @@ def run_rl_offpolicy(args):
         finally:
             _eval_thread_holder[0] = None
 
+    """
+    后台 rollout 线程的主循环。它在后台一直跑，每轮迭代做以下事情：
+        1. 检查 _stop_rollout 是否被设置，如果设置了就退出
+        2. 检查 _rollout_go 是否被暂停（eval 期间会暂停 rollout），如果暂停了就阻塞等待
+        3. 根据是单任务还是多任务，把任务分配到各个 rollout GPU 上
+        4. 在每个 rollout GPU 上并行调用 action_token_collect_* 函数，运行仿真环境收集 episode 数据
+        5. 收集到的 episode 数据推入 replay buffer（通过 push_episodes_to_buffer）
+        6. 向 rollout_stats_queue 发送进度信息（收了多少条 episode）
+    """
     def _rollout_thread_fn(start_iter, max_iter_val):
         """Background thread: continuously collects episodes and pushes to buffer."""
         try:
@@ -755,10 +785,12 @@ def run_rl_offpolicy(args):
                     f"t{tid}={np.mean(v):.0%}" for tid, v in sorted(per_task_sr.items()))
                 logger.info(f"  [rollout iter {it}] Per-task SR: {task_sr_str}")
 
+            # 写入 ReplayBuffer
             with buffer_lock:
                 n_pushed = push_episodes_to_buffer(
                     all_eps, replay_buffer, gamma_per_step=args.gamma)
 
+            # 通知主线程
             rollout_stats_queue.put((all_eps, it, n_pushed))
 
             # ── GPU memory cleanup: 每次迭代清理Rollout GPU缓存 ──
@@ -777,12 +809,13 @@ def run_rl_offpolicy(args):
     # ── VLA Warmup (paper Sec. V): pre-fill buffer with pure VLA rollouts ──
     if args.warmup_iters > 0:
         logger.info(f"=== VLA Warmup: {args.warmup_iters} iters of pure VLA rollout ===")
-        if not args.use_steplock:
+        if not args.use_steplock:     # not True
             for gpu_id, server in rollout_servers.items():
                 server.warmup_mode = True
 
     # ── Training loop (async rollout + TD updates) ────
     # Launch rollout in background
+    # 后台守护线程，作为独立的数据生产者，持续不断地从仿真环境中收集 episode 数据
     rollout_thread = threading.Thread(
         target=_rollout_thread_fn, args=(start_iter, args.max_iter), daemon=True)
     rollout_thread.start()
@@ -798,16 +831,21 @@ def run_rl_offpolicy(args):
         action_token_td_critic_update,
     )
 
+    # 迭代计时器（用于计算 eps/sec, steps/sec 等速度指标）
+    _iter_t0 = time.time()
+
     for iteration in range(start_iter, args.max_iter + 1):
         # ── Drain all available rollout data (non-blocking after first) ────
         all_episodes = []
         # Block on first get (wait for rollout to produce data)
-        result = rollout_stats_queue.get()
+        result = rollout_stats_queue.get()        # 阻塞等数据
         if result is None:
             logger.error("Rollout thread crashed (poison pill). Stopping.")
             break
         eps_batch, rollout_iter, n_pushed = result
         all_episodes = list(eps_batch)
+        logger.info(f"[DEBUG] rollout_stats_queue.get() received {len(all_episodes)} eps "
+                    f"({n_pushed} transitions pushed, rollout_iter={rollout_iter})")
 
         rewards = np.array([ep.reward for ep in all_episodes])
         success_rate = float(np.mean(rewards > 0.5)) if len(rewards) > 0 else 0.0
@@ -818,6 +856,14 @@ def run_rl_offpolicy(args):
             running_sr.pop(0)
         running_sr_avg = np.mean(running_sr)
         best_sr = max(best_sr, success_rate)
+
+        # ── 计算速度指标 ──
+        # 记录从上一轮迭代到本轮拿到数据的耗时（包括等待 rollout 和 push buffer）
+        _iter_elapsed = time.time() - _iter_t0
+        _iter_t0 = time.time()  # 重置计时器
+        eps_per_sec = len(all_episodes) / _iter_elapsed if _iter_elapsed > 0 else 0.0
+        steps_per_sec = iter_env_steps / _iter_elapsed if _iter_elapsed > 0 else 0.0
+        transitions_per_sec = n_pushed / _iter_elapsed if _iter_elapsed > 0 else 0.0
 
         per_task_rollout_sr = {}
         if args.all_tasks:
@@ -837,6 +883,9 @@ def run_rl_offpolicy(args):
                      f"(best={best_sr:.2f}, avg={running_sr_avg:.2f}) "
                      f"| buffer={len(replay_buffer)}/{args.buffer_capacity} "
                      f"| total_env_steps={total_env_steps} | td_steps={td_global_step}")
+        logger.info(f"  Speed: {eps_per_sec:.2f} eps/sec | {steps_per_sec:.0f} steps/sec | "
+                     f"{transitions_per_sec:.0f} trans/sec | "
+                     f"iter_time={_iter_elapsed:.1f}s")
         if task_sr_str:
             logger.info(f"  Per-task rollout SR: {task_sr_str}")
 
@@ -847,7 +896,7 @@ def run_rl_offpolicy(args):
                          f"buffer={len(replay_buffer)} — skipping TD updates")
             # Don't `continue` — fall through to logging + wandb so metrics are tracked
         elif iteration == args.warmup_iters + 1:
-            if args.use_steplock:
+            if args.use_steplock:    # True
                 _steplock_warmup[0] = False
             else:
                 for gpu_id, server in rollout_servers.items():
@@ -897,9 +946,9 @@ def run_rl_offpolicy(args):
                 logger.info(f"[BC Pretrain] Target networks hard-synced (tau=1.0).")
 
         # ── Async TD3 updates: run UTD×new_data updates per new data batch ──
-        # Paper Algorithm 1: TD updates run EVERY step (including warmup),
-        # warmup only controls which action is used for rollout (VLA vs actor).
-        if replay_buffer.is_ready(min_size=args.buffer_warmup):
+        # NOTE: warmup 期间严格跳过 TD3 更新（不论 buffer 是否已满），
+        # 只在 warmup 结束后的迭代才开始训练。
+        if iteration > args.warmup_iters and replay_buffer.is_ready(min_size=args.buffer_warmup):
             actor.train()
             q_critic.train()
 
@@ -978,6 +1027,7 @@ def run_rl_offpolicy(args):
                          f"bc={avg_bc:.4f} q_mean={avg_q:.4f}")
 
             # Sync weights to rollout periodically
+            # 每 500 步同步权重
             if td_global_step - last_sync_step >= sync_every_n_updates:
                 _sync_rollout_weights()
                 last_sync_step = td_global_step
@@ -1029,7 +1079,7 @@ def run_rl_offpolicy(args):
         per_task_eval_sr = {}
         do_eval = (args.eval_interval > 0
                    and (iteration == 1 or iteration % args.eval_interval == 0))
-        if do_eval:
+        if do_eval:    
             save_video = (args.save_video_interval > 0 and
                           (iteration == 1 or iteration % args.save_video_interval == 0))
             with _eval_lock:
@@ -1080,6 +1130,11 @@ def run_rl_offpolicy(args):
                 "mean_reward": float(np.mean(rewards)) if len(rewards) > 0 else 0.0,
                 "buffer_size": len(replay_buffer),
                 "n_pushed": n_pushed,
+                # 速度/频率指标
+                "eps_per_sec": eps_per_sec,
+                "steps_per_sec": steps_per_sec,
+                "transitions_per_sec": transitions_per_sec,
+                "iter_time_sec": _iter_elapsed,
             }
             if td_stats_list:
                 avg_fn = lambda k: float(np.mean([s[k] for s in td_stats_list if k in s]))
@@ -1110,6 +1165,10 @@ def run_rl_offpolicy(args):
                     "rollout/mean_reward": log_entry["mean_reward"],
                     "rollout/total_env_steps": total_env_steps,
                     "rollout/iter_env_steps": iter_env_steps,
+                    "rollout/eps_per_sec": eps_per_sec,
+                    "rollout/steps_per_sec": steps_per_sec,
+                    "rollout/transitions_per_sec": transitions_per_sec,
+                    "rollout/iter_time_sec": _iter_elapsed,
                     "buffer/size": len(replay_buffer),
                     "buffer/pushed": n_pushed,
                 }

@@ -58,7 +58,11 @@ def _env_dummy_steps(env_pool, env_idx, n_steps):
         obs, _, _ = env_pool.step_env(env_idx, DUMMY_ACTION)
     return obs
 
-
+"""
+ 这是一个 step-lock（步锁）架构的并行 rollout 采集函数，是 RLActionToken 强化学习系统中核心的性能瓶颈突破点。
+ 它在同一 GPU 上并行运行 G 个环境实例，以 lockstep（齐步走） 的方式用 单次 GPU 批处理调用 同时为所有活跃环境推理，
+ 大幅提升 GPU 利用率。
+ """
 @torch.no_grad()
 def action_token_collect_group_steplock(
     env_pool: PersistentEnvPool,
@@ -115,7 +119,8 @@ def action_token_collect_group_steplock(
 
     n_workers = min(G, len(env_pool))
 
-    # ── Phase 1: Reset all envs in parallel ──
+    # ── Phase 1: Reset all envs in parallel   使用 G 个线程并行重置所有环境 ──
+    # 多线程并行重置（Parallel Reset）：利用 ThreadPoolExecutor 并行调用env_pool.reset_env，让G个环境同时初始化
     from concurrent.futures import as_completed as _as_completed
     obs_list = [None] * G
     with ThreadPoolExecutor(max_workers=G) as _pool:
@@ -127,6 +132,7 @@ def action_token_collect_group_steplock(
     task_descriptions = [env_pool.envs[env_offset + g].task_description for g in range(G)]
 
     # ── Phase 2: Warmup dummy steps (parallel) ──
+    # 所有环境并行执行 num_steps_wait 步零动作，让仿真的物理世界（如 MuJoCo 或 Isaac Gym）的刚体碰撞、重力过渡稳定下来
     if num_steps_wait > 0:
         with ThreadPoolExecutor(max_workers=G) as _pool:
             _futs = {_pool.submit(_env_dummy_steps, env_pool, env_offset + g, num_steps_wait): g for g in range(G)}
@@ -155,11 +161,11 @@ def action_token_collect_group_steplock(
     _mem_reserved_start = torch.cuda.memory_reserved(device) / 1024**3
     print(f"  [GPU MEM @ start] allocated={_mem_alloc_start:.2f}GB  reserved={_mem_reserved_start:.2f}GB", flush=True)
 
+    # [环境状态/图像] ──> 1. VLA 模型推理 ──> 2. RL 模型微调/动作采样 ──> 3. 动作反归一化 ──> 4. 多环境并行执行并记录数据
     for chunk_idx in range(max_chunks):
         active_ids = [g for g in range(G) if active[g]]
         if not active_ids:
             break
-
         _t_chunk_start = time.time()
 
         # ── Step 1: Batch VLA forward for all active envs ──
@@ -170,7 +176,7 @@ def action_token_collect_group_steplock(
 
         print(f"  [VLA forward] batch={len(batch_images)}, active_envs={len(active_ids)}", flush=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            action_queries, vla_actions = frozen_vla.get_vla_action(
+            action_queries, vla_actions = frozen_vla.get_vla_action(    # [2,8,2048] [2,8,7]
                 batch_images=batch_images, instructions=batch_instrs)
         torch.cuda.synchronize()
         _t1 = time.time()
@@ -179,18 +185,26 @@ def action_token_collect_group_steplock(
 
         # ── Step 2: Batch encoder + actor ──
         _t0 = time.time()
-        rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)
+        rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)   (2,1,256)
         # 显存优化：action_queries 使用完毕后立即删除（释放QwenVL中间隐状态的最后一个引用）
         del action_queries
 
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         # Slice VLA actions for actor if actor uses shorter chunk
+        # 如果 actor_chunk_len < vla_actions.size(1)，先裁剪 VLA 动作到 actor 需要的长度
         if actor_chunk_len < vla_actions.size(1):
             vla_actions_for_actor = vla_actions[:, :actor_chunk_len, :]
         else:
             vla_actions_for_actor = vla_actions
 
+        """
+        warmup_mode=True：直接使用 VLA 原始动作，跳过 actor（回放缓冲区预填充）
+        warmup_mode=False（正常 RL 训练）：
+            Actor 以 RL token + VLA 输出的参考动作 + 本体感受为输入，输出编辑后的动作和对应的对数概率
+            Critic 估计每个状态的 状态价值 V(s)
+            deterministic=False 意味着动作采样的随机策略，用于探索
+        """
         if warmup_mode:
             # Warmup: use VLA actions directly, skip actor (like BatchInferenceServer.warmup_mode)
             actions_t = vla_actions_for_actor
@@ -208,6 +222,8 @@ def action_token_collect_group_steplock(
         vla_actions_cpu = vla_actions_for_actor.cpu()
 
         # ── Store step records ──
+        # 把刚刚在 GPU 里面由大模型（VLA）和强化学习网络（Actor-Critic）实时计算出来的各种高维张量（Tensor）
+        # “打包”并“搬运”到 CPU 内存中，像写日记一样，记录下当前时间步机器人的所有“所思所想”和“所作所为”
         _t0 = time.time()
         for i, g in enumerate(active_ids):
             sr = ActionTokenStepRecord(
@@ -220,7 +236,7 @@ def action_token_collect_group_steplock(
                 images=[obs_list[g]["primary_image"].copy(), obs_list[g]["wrist_image"].copy()] if store_images else None,
                 instruction=task_descriptions[g] if store_images else None,
             )
-            episodes[g].step_records.append(sr)
+            episodes[g].step_records.append(sr) # 打包好这个时间步的记录 sr 后，代码顺着环境索引 g，把它塞进了属于该环境的专属故事线 episodes[g] 的列表末尾
         _t1 = time.time()
         _t_store_records += _t1 - _t0
 
@@ -244,6 +260,7 @@ def action_token_collect_group_steplock(
         # ── Step 4: All envs execute chunk in parallel ──
         _t0 = time.time()
         record_video = video_dir is not None
+        # 拿到了真正的物理动作后，再次启动 ThreadPoolExecutor 线程池
         with ThreadPoolExecutor(max_workers=len(active_ids)) as _pool:
             _futs = {}
             for i, g in enumerate(active_ids):
