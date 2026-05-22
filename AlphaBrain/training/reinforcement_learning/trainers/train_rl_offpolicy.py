@@ -377,6 +377,24 @@ def run_rl_offpolicy(args):
     running_sr = []
     total_env_steps = 0  # cumulative environment steps (sample steps)
 
+    # ── Cumulative training statistics for convergence monitoring ──
+    cumulative_td_stats = {
+        "total_td_updates": 0,             # total TD update batches performed
+        "total_transitions_trained": 0,    # total transitions sampled for training (batch_sz * n_updates cumulative)
+        "total_actor_updates": 0,          # total actor parameter updates
+        "total_critic_updates": 0,         # total critic parameter updates (every TD step)
+        "per_iter_critic_loss": [],        # average critic loss per iteration
+        "per_iter_actor_loss": [],         # average actor loss per iteration
+        "per_iter_q1_mean": [],            # average Q1 per iteration
+        "per_iter_q2_mean": [],            # average Q2 per iteration
+        "per_iter_target_mean": [],        # average target Q per iteration
+        "per_iter_bc_penalty": [],         # average BC penalty per iteration
+        "per_iter_buffer_size": [],        # buffer size at each iteration
+        "per_iter_td_steps": [],           # number of TD update steps per iteration
+        "per_iter_env_steps_cum": [],      # cumulative env steps at each iteration
+        "per_iter_success_rate": [],       # rollout success rate per iteration
+    }
+
     # ── Async rollout helper ────────────────────────────
     # Rollout runs on background threads (rollout GPUs) while TD updates
     # run on the main thread (train GPU). This matches the PI paper's
@@ -984,7 +1002,15 @@ def run_rl_offpolicy(args):
                 optimizer_critic.step()
 
                 a_stats = {"actor_loss": 0.0, "q_actor_mean": 0.0, "bc_penalty": 0.0}
-                if (td_step + 1) % args.actor_update_freq == 0:
+                # TD3 delayed actor update: update actor every `actor_update_freq` critic updates.
+                # BUG GUARD: if n_updates < actor_update_freq (e.g. n_updates=1, freq=2),
+                # the condition `(0+1)%2==0` never triggers → actor is NEVER updated.
+                # Force actor update on the LAST td_step if not yet updated this iteration.
+                _should_update_actor = ((td_step + 1) % args.actor_update_freq == 0)
+                if not _should_update_actor and n_updates < args.actor_update_freq:
+                    # n_updates too small for delayed update to ever trigger → force update
+                    _should_update_actor = (td_step == n_updates - 1)
+                if _should_update_actor:
                     optimizer_actor.zero_grad()
                     actor_loss, a_stats = action_token_td_actor_update(
                         actor=actor,
@@ -1020,16 +1046,40 @@ def run_rl_offpolicy(args):
                     "q2_mean": c_stats.get("q2_mean", 0.0),
                     "bc_penalty": a_stats.get("bc_penalty", 0.0),
                 })
+                # ── Track cumulative training statistics ──
+                cumulative_td_stats["total_td_updates"] += 1
+                cumulative_td_stats["total_transitions_trained"] += batch_sz
+                cumulative_td_stats["total_critic_updates"] += 1
+                # 计数必须与 Actor 实际执行更新的条件一致（包括 bug guard 的强制更新分支）
+                if _should_update_actor:
+                    cumulative_td_stats["total_actor_updates"] += 1
                 td_global_step += 1
 
-            avg_td = np.mean([s["td_loss"] for s in td_stats_list])
-            avg_critic = np.mean([s["critic_loss"] for s in td_stats_list])
-            avg_actor = np.mean([s["actor_loss"] for s in td_stats_list])
-            avg_bc = np.mean([s.get("bc_penalty", 0.0) for s in td_stats_list])
-            avg_q = np.mean([s.get("q1_mean", 0.0) for s in td_stats_list])
-            logger.info(f"[iter {iteration}] TD3: {n_updates} updates (UTD={n_new_transitions}×{args.utd_ratio}/{batch_sz}→{n_updates}) "
-                         f"critic={avg_critic:.4f} actor={avg_actor:.4f} "
-                         f"bc={avg_bc:.4f} q_mean={avg_q:.4f}")
+            # ── Record per-iteration cumulative stats ──
+            cumulative_td_stats["per_iter_critic_loss"].append(avg_critic := np.mean([s["critic_loss"] for s in td_stats_list]))
+            cumulative_td_stats["per_iter_actor_loss"].append(avg_actor := np.mean([s["actor_loss"] for s in td_stats_list]))
+            cumulative_td_stats["per_iter_q1_mean"].append(np.mean([s.get("q1_mean", 0.0) for s in td_stats_list]))
+            cumulative_td_stats["per_iter_q2_mean"].append(np.mean([s.get("q2_mean", 0.0) for s in td_stats_list]))
+            cumulative_td_stats["per_iter_target_mean"].append(np.mean([s.get("target_mean", 0.0) for s in td_stats_list]))
+            cumulative_td_stats["per_iter_bc_penalty"].append(np.mean([s.get("bc_penalty", 0.0) for s in td_stats_list]))
+            cumulative_td_stats["per_iter_buffer_size"].append(len(replay_buffer))
+            cumulative_td_stats["per_iter_td_steps"].append(n_updates)
+            cumulative_td_stats["per_iter_env_steps_cum"].append(total_env_steps)
+            cumulative_td_stats["per_iter_success_rate"].append(success_rate)
+
+            avg_td = avg_critic + avg_actor
+            avg_q = cumulative_td_stats["per_iter_q1_mean"][-1]
+            avg_q2 = cumulative_td_stats["per_iter_q2_mean"][-1]
+            avg_target = cumulative_td_stats["per_iter_target_mean"][-1]
+            avg_bc = cumulative_td_stats["per_iter_bc_penalty"][-1]
+            logger.info(f"[iter {iteration}] TD3: {n_updates} updates "
+                        f"(UTD={n_new_transitions}×{args.utd_ratio}/{batch_sz}→{n_updates}) "
+                        f"critic={avg_critic:.4f} actor={avg_actor:.4f} "
+                        f"bc={avg_bc:.4f} q1={avg_q:.4f} q2={avg_q2:.4f} target={avg_target:.4f}")
+            logger.info(f"  [cumulative] total_td_updates={cumulative_td_stats['total_td_updates']}, "
+                        f"total_transitions_trained={cumulative_td_stats['total_transitions_trained']}, "
+                        f"actor_updates={cumulative_td_stats['total_actor_updates']}, "
+                        f"critic_updates={cumulative_td_stats['total_critic_updates']}")
 
             # Sync weights to rollout periodically
             # 每 500 步同步权重
@@ -1270,52 +1320,301 @@ def run_rl_offpolicy(args):
         json.dump(td3_step_loss_history, f, indent=2)
     logger.info(f"TD3 loss curves saved -> {loss_curves_path} ({len(td3_step_loss_history)} steps)")
 
-    # ── Plot loss curves (if matplotlib available) ───────────
+    # ── Plot loss curves & convergence metrics (if matplotlib available) ──
     if len(td3_step_loss_history) > 1:
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+            from matplotlib.ticker import MaxNLocator
 
             td_steps = [s["td_step"] for s in td3_step_loss_history]
             critic_losses = [s["critic_loss"] for s in td3_step_loss_history]
             actor_losses = [s["actor_loss"] for s in td3_step_loss_history]
+            q1_means = [s.get("q1_mean", 0.0) for s in td3_step_loss_history]
+            q2_means = [s.get("q2_mean", 0.0) for s in td3_step_loss_history]
+            bc_penalties = [s.get("bc_penalty", 0.0) for s in td3_step_loss_history]
 
-            fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+            fig, axes = plt.subplots(4, 1, figsize=(16, 14), sharex=True)
 
-            # Critic loss
-            axes[0].plot(td_steps, critic_losses, label="Critic Loss", color="tab:blue", alpha=0.7, linewidth=0.5)
+            # Smoothing function (scipy-based, with numpy fallback)
+            try:
+                from scipy.ndimage import uniform_filter1d
+                def _smooth(arr, w):
+                    w = max(1, min(w, len(arr)))
+                    return uniform_filter1d(arr, size=w)
+            except ImportError:
+                def _smooth(arr, w):
+                    w = max(1, min(w, len(arr)))
+                    return np.convolve(arr, np.ones(w)/w, mode='same')
+            window = max(1, len(td_steps) // 100)
+            critic_smooth = _smooth(critic_losses, window)
+            axes[0].plot(td_steps, critic_losses, label="Critic Loss (raw)", color="tab:blue", alpha=0.3, linewidth=0.5)
+            axes[0].plot(td_steps, critic_smooth, label=f"Critic Loss (smooth, w={window})", color="tab:blue", alpha=0.9, linewidth=1.5)
+            axes[0].axhline(y=np.mean(critic_losses[-max(1, len(critic_losses)//10):]), color="darkblue", linestyle="--", alpha=0.5, label="Final avg")
             axes[0].set_ylabel("Critic Loss (MSE)")
-            axes[0].set_title("TD3 Critic Loss per TD Step")
-            axes[0].legend()
+            axes[0].set_title("TD3 Critic Loss per TD Step (convergence → stable low loss)")
+            axes[0].legend(fontsize=8)
             axes[0].grid(True, alpha=0.3)
 
-            # Actor loss (skip zero entries where actor wasn't updated)
+            # 2. Actor loss (skip zero entries where actor wasn't updated)
             nonzero_mask = [s["actor_loss"] > 1e-8 for s in td3_step_loss_history]
             td_steps_actor = [s["td_step"] for s, m in zip(td3_step_loss_history, nonzero_mask) if m]
             actor_losses_nonzero = [s["actor_loss"] for s, m in zip(td3_step_loss_history, nonzero_mask) if m]
-            axes[1].plot(td_steps_actor, actor_losses_nonzero, label="Actor Loss", color="tab:orange", alpha=0.7, linewidth=0.5)
-            axes[1].set_xlabel("TD Step")
+            if actor_losses_nonzero:
+                actor_smooth = _smooth(actor_losses_nonzero, min(window, len(actor_losses_nonzero)))
+                axes[1].plot(td_steps_actor, actor_losses_nonzero, label="Actor Loss (raw)", color="tab:orange", alpha=0.3, linewidth=0.5)
+                axes[1].plot(td_steps_actor, actor_smooth, label=f"Actor Loss (smooth, w={window})", color="tab:orange", alpha=0.9, linewidth=1.5)
+                axes[1].axhline(y=np.mean(actor_losses_nonzero[-max(1, len(actor_losses_nonzero)//10):]), color="darkorange", linestyle="--", alpha=0.5, label="Final avg")
             axes[1].set_ylabel("Actor Loss")
             axes[1].set_title("TD3 Actor Loss per TD Step (only on update steps)")
-            axes[1].legend()
+            axes[1].legend(fontsize=8)
             axes[1].grid(True, alpha=0.3)
 
+            # 3. Q-values (Q1, Q2, Target) — convergence indicator
+            q1_smooth = _smooth(q1_means, window)
+            q2_smooth = _smooth(q2_means, window)
+            axes[2].plot(td_steps, q1_means, label="Q1 (raw)", color="tab:green", alpha=0.2, linewidth=0.5)
+            axes[2].plot(td_steps, q1_smooth, label="Q1 (smooth)", color="tab:green", alpha=0.8, linewidth=1.5)
+            axes[2].plot(td_steps, q2_means, label="Q2 (raw)", color="tab:red", alpha=0.2, linewidth=0.5)
+            axes[2].plot(td_steps, q2_smooth, label="Q2 (smooth)", color="tab:red", alpha=0.8, linewidth=1.5)
+            axes[2].set_ylabel("Q Value")
+            axes[2].set_title("Q-Value Convergence (stable Q1/Q2 → critic has learned accurate values)")
+            axes[2].legend(fontsize=8)
+            axes[2].grid(True, alpha=0.3)
+
+            # 4. BC Penalty — anchors actor to VLA reference
+            if any(b > 1e-6 for b in bc_penalties):
+                bc_smooth = _smooth(bc_penalties, window)
+                axes[3].plot(td_steps, bc_penalties, label="BC Penalty (raw)", color="tab:purple", alpha=0.3, linewidth=0.5)
+                axes[3].plot(td_steps, bc_smooth, label=f"BC Penalty (smooth, w={window})", color="tab:purple", alpha=0.9, linewidth=1.5)
+                axes[3].set_ylabel("BC Penalty")
+                axes[3].set_title("BC Regularization (convergence → stable deviation from VLA reference)")
+                axes[3].legend(fontsize=8)
+                axes[3].grid(True, alpha=0.3)
+            else:
+                axes[3].text(0.5, 0.5, "No BC penalty data", transform=axes[3].transAxes, ha="center", va="center")
+            axes[3].set_xlabel("TD Step")
+
+            for ax in axes:
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+
             plt.tight_layout()
-            plot_path = Path(args.output_dir) / "td3_loss_curves.png"
+            plot_path = Path(args.output_dir) / "td3_convergence_curves.png"
             plt.savefig(str(plot_path), dpi=150, bbox_inches="tight")
             plt.close(fig)
-            logger.info(f"TD3 loss curves plot saved -> {plot_path}")
+            logger.info(f"TD3 convergence curves plot saved -> {plot_path}")
+
+            # Also save the original 2-panel plot for compact view
+            fig2, axes2 = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+            axes2[0].plot(td_steps, critic_losses, label="Critic Loss", color="tab:blue", alpha=0.7, linewidth=0.5)
+            axes2[0].plot(td_steps, critic_smooth, label="Smoothed", color="tab:blue", alpha=0.9, linewidth=1.5)
+            axes2[0].set_ylabel("Critic Loss (MSE)")
+            axes2[0].set_title("TD3 Critic Loss per TD Step")
+            axes2[0].legend()
+            axes2[0].grid(True, alpha=0.3)
+
+            if actor_losses_nonzero:
+                axes2[1].plot(td_steps_actor, actor_losses_nonzero, label="Actor Loss", color="tab:orange", alpha=0.7, linewidth=0.5)
+                axes2[1].plot(td_steps_actor, actor_smooth, label="Smoothed", color="tab:orange", alpha=0.9, linewidth=1.5)
+            axes2[1].set_xlabel("TD Step")
+            axes2[1].set_ylabel("Actor Loss")
+            axes2[1].set_title("TD3 Actor Loss per TD Step (only on update steps)")
+            axes2[1].legend()
+            axes2[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path2 = Path(args.output_dir) / "td3_loss_curves.png"
+            plt.savefig(str(plot_path2), dpi=150, bbox_inches="tight")
+            plt.close(fig2)
+            logger.info(f"TD3 loss curves plot saved -> {plot_path2}")
         except ImportError:
             logger.warning("matplotlib not installed — skipping loss curve plot")
         except Exception as e:
             logger.warning(f"Failed to plot loss curves: {e}")
 
+    # ── Convergence Summary Table ─────────────────────────────────────
+    # Compute and log a comprehensive summary of actor/critic convergence
+    def _build_convergence_summary():
+        """Build a dict with all convergence-relevant metrics for final reporting."""
+        summary = {}
+
+        # 1. Basic training scale
+        summary["training_scale"] = {
+            "total_iterations": args.max_iter,
+            "completed_iterations": iteration,  # last iteration number
+            "total_env_steps": total_env_steps,
+            "final_buffer_size": len(replay_buffer),
+            "total_td_updates": cumulative_td_stats["total_td_updates"],
+            "total_transitions_trained": cumulative_td_stats["total_transitions_trained"],
+            "total_actor_updates": cumulative_td_stats["total_actor_updates"],
+            "total_critic_updates": cumulative_td_stats["total_critic_updates"],
+            "td_global_step": td_global_step,
+            "actor_update_freq": args.actor_update_freq,
+            "utd_ratio": args.utd_ratio,
+            "td_batch_size": args.td_batch_size,
+        }
+
+        # 2. Final performance metrics
+        summary["final_performance"] = {
+            "best_rollout_sr": best_sr,
+            "best_eval_sr": best_eval_sr,
+            "final_rollout_sr": float(cumulative_td_stats["per_iter_success_rate"][-1]) if cumulative_td_stats["per_iter_success_rate"] else 0.0,
+            "running_avg_sr": float(np.mean(cumulative_td_stats["per_iter_success_rate"][-10:])) if len(cumulative_td_stats["per_iter_success_rate"]) >= 10 else float(np.mean(cumulative_td_stats["per_iter_success_rate"])) if cumulative_td_stats["per_iter_success_rate"] else 0.0,
+        }
+
+        # 3. Convergence metrics at different stages
+        n_stages = min(5, len(cumulative_td_stats["per_iter_critic_loss"]))
+        if n_stages > 0:
+            stage_summaries = {}
+            total_iters = len(cumulative_td_stats["per_iter_critic_loss"])
+            for stage_idx in range(n_stages):
+                # Evenly spaced stages: early, 25%, 50%, 75%, late
+                pct = stage_idx / (n_stages - 1) if n_stages > 1 else 0.5
+                iter_pos = int(pct * (total_iters - 1))
+                stage_name = {0: "early", 1: "mid_early", 2: "mid", 3: "mid_late", 4: "late"}.get(stage_idx, f"stage_{stage_idx}")
+
+                # Use a window of ±2 iterations around this position for smoothing
+                half_w = max(1, total_iters // max(1, n_stages * 4))
+                lo = max(0, iter_pos - half_w)
+                hi = min(total_iters, iter_pos + half_w + 1)
+                window = slice(lo, hi)
+
+                stage_summaries[stage_name] = {
+                    "iter_range": f"{cumulative_td_stats['per_iter_env_steps_cum'][lo] if lo < len(cumulative_td_stats['per_iter_env_steps_cum']) else 0}-{cumulative_td_stats['per_iter_env_steps_cum'][hi-1] if hi-1 < len(cumulative_td_stats['per_iter_env_steps_cum']) else 0}_env_steps",
+                    "critic_loss_avg": float(np.mean(cumulative_td_stats["per_iter_critic_loss"][window])),
+                    "actor_loss_avg": float(np.mean(cumulative_td_stats["per_iter_actor_loss"][window])),
+                    "q1_mean_avg": float(np.mean(cumulative_td_stats["per_iter_q1_mean"][window])),
+                    "q2_mean_avg": float(np.mean(cumulative_td_stats["per_iter_q2_mean"][window])),
+                    "target_mean_avg": float(np.mean(cumulative_td_stats["per_iter_target_mean"][window])),
+                    "bc_penalty_avg": float(np.mean(cumulative_td_stats["per_iter_bc_penalty"][window])),
+                    "buffer_size": int(np.mean(cumulative_td_stats["per_iter_buffer_size"][window])),
+                    "success_rate_avg": float(np.mean(cumulative_td_stats["per_iter_success_rate"][window])),
+                }
+            summary["convergence_stages"] = stage_summaries
+
+        # 4. Convergence verdict (final phase metrics)
+        if len(cumulative_td_stats["per_iter_actor_loss"]) >= 5:
+            # Take last 20% or at least 5 iterations as "convergence phase"
+            n_late = max(5, len(cumulative_td_stats["per_iter_actor_loss"]) // 5)
+            late_losses_actor = cumulative_td_stats["per_iter_actor_loss"][-n_late:]
+            late_losses_critic = cumulative_td_stats["per_iter_critic_loss"][-n_late:]
+            late_bc = cumulative_td_stats["per_iter_bc_penalty"][-n_late:]
+            late_q1 = cumulative_td_stats["per_iter_q1_mean"][-n_late:]
+            late_sr = cumulative_td_stats["per_iter_success_rate"][-n_late:]
+
+            summary["convergence_phase"] = {
+                "n_iterations_analyzed": n_late,
+                "iter_range": f"iter_{max(1, len(cumulative_td_stats['per_iter_actor_loss']) - n_late + 1)}-{len(cumulative_td_stats['per_iter_actor_loss'])}",
+                "actor_loss_mean": float(np.mean(late_losses_actor)),
+                "actor_loss_std": float(np.std(late_losses_actor)),
+                "actor_loss_min": float(np.min(late_losses_actor)),
+                "actor_loss_max": float(np.max(late_losses_actor)),
+                "critic_loss_mean": float(np.mean(late_losses_critic)),
+                "critic_loss_std": float(np.std(late_losses_critic)),
+                "critic_loss_min": float(np.min(late_losses_critic)),
+                "critic_loss_max": float(np.max(late_losses_critic)),
+                "bc_penalty_mean": float(np.mean(late_bc)),
+                "q1_mean": float(np.mean(late_q1)),
+                "rollout_sr_mean": float(np.mean(late_sr)),
+                "rollout_sr_std": float(np.std(late_sr)),
+            }
+        else:
+            summary["convergence_phase"] = {"note": "insufficient data for convergence analysis"}
+
+        return summary
+
+    convergence_summary = _build_convergence_summary()
+
+    # ── Save final metrics and convergence summary ──
     metrics_path = Path(args.output_dir) / "metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     with open(metrics_path, "w") as f:
         json.dump(metrics_history, f, indent=2)
-    logger.info(f"Done. Metrics -> {metrics_path}")
+    logger.info(f"Metrics saved -> {metrics_path}")
+
+    summary_path = Path(args.output_dir) / "convergence_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(convergence_summary, f, indent=2, default=str)
+    logger.info(f"Convergence summary saved -> {summary_path}")
+
+    # ── Log a human-readable convergence table ──
+    logger.info("")
+    logger.info("=" * 90)
+    logger.info("  🎯 TRAINING COMPLETE — ACTOR/CRITIC CONVERGENCE SUMMARY")
+    logger.info("=" * 90)
+    logger.info("")
+
+    scale = convergence_summary["training_scale"]
+    logger.info("  ┌── Training Scale ──────────────────────────────────────────────┐")
+    logger.info(f"  │  Total iterations          : {scale['completed_iterations']:>8d} / {scale['total_iterations']:<8d}      │")
+    logger.info(f"  │  Total env steps           : {scale['total_env_steps']:>12d}                  │")
+    logger.info(f"  │  Final buffer size         : {scale['final_buffer_size']:>12d}                  │")
+    logger.info(f"  │  Total TD update batches   : {scale['total_td_updates']:>12d}                  │")
+    logger.info(f"  │  Total transitions trained : {scale['total_transitions_trained']:>12d}                  │")
+    logger.info(f"  │  Total actor param updates : {scale['total_actor_updates']:>12d}                  │")
+    logger.info(f"  │  Total critic param updates: {scale['total_critic_updates']:>12d}                  │")
+    logger.info(f"  │  TD batch size / UTD ratio : {scale['td_batch_size']:>8d} / {scale['utd_ratio']:<8.1f}          │")
+    logger.info("  └────────────────────────────────────────────────────────────────┘")
+    logger.info("")
+
+    perf = convergence_summary["final_performance"]
+    logger.info("  ┌── Final Performance ───────────────────────────────────────────┐")
+    logger.info(f"  │  Best rollout SR           : {perf['best_rollout_sr']:>12.2%}                  │")
+    logger.info(f"  │  Best eval SR              : {perf['best_eval_sr']:>12.2%}                  │")
+    logger.info(f"  │  Final rollout SR          : {perf['final_rollout_sr']:>12.2%}                  │")
+    logger.info(f"  │  Running avg SR (last 10)  : {perf['running_avg_sr']:>12.2%}                  │")
+    logger.info("  └────────────────────────────────────────────────────────────────┘")
+    logger.info("")
+
+    if "convergence_stages" in convergence_summary:
+        stages = convergence_summary["convergence_stages"]
+        logger.info("  ┌── Convergence Across Stages ────────────────────────────────────┐")
+        logger.info("  │  Stage    │ Critic Loss │ Actor Loss │  Q1 Mean  │ BC Penalty │  SR   │")
+        logger.info("  ├──────────┼─────────────┼────────────┼───────────┼────────────┼───────┤")
+        for stage_name in ["early", "mid_early", "mid", "mid_late", "late"]:
+            if stage_name in stages:
+                s = stages[stage_name]
+                line = (f"  │  {stage_name:<8s} │ {s['critic_loss_avg']:>10.4f} │ {s['actor_loss_avg']:>9.4f} │"
+                        f" {s['q1_mean_avg']:>8.2f} │ {s['bc_penalty_avg']:>10.4f} │ {s['success_rate_avg']:>5.1%} │")
+                logger.info(line)
+        logger.info("  └──────────┴─────────────┴────────────┴───────────┴────────────┴───────┘")
+        logger.info("")
+
+    if "convergence_phase" in convergence_summary and "actor_loss_mean" in convergence_summary["convergence_phase"]:
+        cp = convergence_summary["convergence_phase"]
+        logger.info("  ┌── Convergence Phase (last {} iterations) ──────────────────────┐".format(cp['n_iterations_analyzed']))
+        logger.info(f"  │  Iter range                  : {cp['iter_range']:<45s} │")
+        logger.info(f"  │  Actor loss  : mean={cp['actor_loss_mean']:.4f}  std={cp['actor_loss_std']:.4f}  "
+                    f"min={cp['actor_loss_min']:.4f}  max={cp['actor_loss_max']:.4f}   │")
+        logger.info(f"  │  Critic loss : mean={cp['critic_loss_mean']:.4f}  std={cp['critic_loss_std']:.4f}  "
+                    f"min={cp['critic_loss_min']:.4f}  max={cp['critic_loss_max']:.4f}   │")
+        logger.info(f"  │  BC penalty mean             : {cp['bc_penalty_mean']:.6f}                      │")
+        logger.info(f"  │  Q1 mean (convergence phase) : {cp['q1_mean']:.2f}                              │")
+        logger.info(f"  │  Rollout SR (convergence)    : {cp['rollout_sr_mean']:.2%} ± {cp['rollout_sr_std']:.2%}                 │")
+        logger.info("  └────────────────────────────────────────────────────────────────┘")
+        logger.info("")
+        logger.info("  Convergence verdict:")
+        if cp['critic_loss_std'] < 0.01 and cp['actor_loss_std'] < 0.01:
+            logger.info("    ✅ Actor and Critic appear CONVERGED (low loss variance)")
+        elif cp['critic_loss_std'] < 0.05:
+            logger.info("    ⚠️  Critic appears stable, Actor still has variance")
+        elif cp['actor_loss_std'] < 0.05:
+            logger.info("    ⚠️  Actor appears stable, Critic still has variance")
+        else:
+            logger.info("    🔄 Both Actor and Critic still have high variance — more training may help")
+        if cp['rollout_sr_mean'] < 0.3:
+            logger.info("    ⚠️  Low success rate — consider longer training or tuning hyperparameters")
+        logger.info("")
+    else:
+        logger.info("  (Insufficient TD3 data for convergence phase analysis)")
+        logger.info("")
+
+    logger.info("  Detailed data saved to:")
+    logger.info(f"    - {summary_path}")
+    logger.info(f"    - {loss_curves_path}")
+    logger.info(f"    - {metrics_path}")
+    logger.info("=" * 90)
 
     if args.use_wandb:
         wandb.finish()

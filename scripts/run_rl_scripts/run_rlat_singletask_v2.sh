@@ -48,17 +48,17 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --actor_hidden_dim 512 \
     --critic_hidden_dim 512 \
     --ref_dropout 0.5 \
-    --fixed_std 0.3 \
+    --fixed_std 0.2 \
     --G_per_task 60 \
     --group_size 1 \
-    --num_envs_per_task 2 \
+    --num_envs_per_task 6 \
     --reward_coef 5.0 \
     --lr_actor 3e-4 \
     --lr_critic 3e-4 \
     --gamma 0.99 \
     --max_grad_norm 1.0 \
     --buffer_capacity 1000000 \
-    --buffer_warmup 1024 \
+    --buffer_warmup 10240 \
     --warmup_iters 20 \
     --bc_pretrain_steps 5000 \
     --td_updates_per_iter 50000 \

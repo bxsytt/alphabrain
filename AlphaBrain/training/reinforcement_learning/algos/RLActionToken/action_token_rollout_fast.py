@@ -134,11 +134,15 @@ def action_token_collect_group_steplock(
     # 多线程并行重置（Parallel Reset）：利用 ThreadPoolExecutor 并行调用env_pool.reset_env，让G个环境同时初始化
     from concurrent.futures import as_completed as _as_completed
     obs_list = [None] * G
-    with ThreadPoolExecutor(max_workers=G) as _pool:
-        _futs = {_pool.submit(env_pool.reset_env, env_offset + g, suite_name, task_id, int(state_ids[g]), seed + g): g for g in range(G)}
-        for _f in _as_completed(_futs):
-            obs_list[_futs[_f]] = _f.result()
-    print(f"  reset done: {G} envs (parallel)", flush=True)
+    try:
+        with ThreadPoolExecutor(max_workers=G) as _pool:
+            _futs = {_pool.submit(env_pool.reset_env, env_offset + g, suite_name, task_id, int(state_ids[g]), seed + g): g for g in range(G)}
+            for _f in _as_completed(_futs):
+                obs_list[_futs[_f]] = _f.result()
+        print(f"  reset done: {G} envs (parallel)", flush=True)
+    except RuntimeError:
+        # Ignore shutdown errors during interpreter exit
+        return []
 
     task_descriptions = [env_pool.envs[env_offset + g].task_description for g in range(G)]
 
@@ -325,7 +329,7 @@ def action_token_collect_group_steplock(
             for k, (g, sub_idx, sub_o) in enumerate(flat_sub):
                 step_record = episodes[g].step_records[-1]  # the record just appended
                 step_record.sub_tokens.append((
-                    rt_sub[k].cpu().squeeze(0),     # rl_token (1, D)
+                    rt_sub[k:k+1].cpu().squeeze(0),   # rl_token (1, D)
                     va_sub[k].cpu(),                 # vla_action (C, A)
                     torch.tensor(sub_o["state"]),    # prop_state
                 ))
@@ -600,7 +604,7 @@ def action_token_collect_multitask_steplock(
             for k, (g, sub_idx, sub_o) in enumerate(flat_sub):
                 step_record = episodes[g].step_records[-1]
                 step_record.sub_tokens.append((
-                    rt_sub[k].cpu().squeeze(0),
+                    rt_sub[k:k+1].cpu().squeeze(0),
                     va_sub[k].cpu(),
                     torch.tensor(sub_o["state"]),
                 ))
