@@ -177,11 +177,11 @@ def main():
                 steps_taken = 0
                 sub_obs = []  # intermediate observations at stride positions
                 for a in actions:
-                    obs, reward, done, info = env.step(a)
+                    obs, reward, done, info = env.step(a)    # <-- 1. 物理引擎步进
                     steps_taken += 1
                     # Collect intermediate obs at stride positions (before done triggers)
                     if steps_taken in sub_positions and not done:
-                        sub_obs.append(_parse_obs(obs))
+                        sub_obs.append(_parse_obs(obs))      # <-- 2. 在指定步数进行"截屏"
                     if done:
                         final_done = True
                         final_reward = float(reward)
@@ -190,7 +190,7 @@ def main():
                     final_reward = float(reward)
                 _write_msg_sock(sock, {
                     "status": "ok",
-                    "obs": _parse_obs(obs),
+                    "obs": _parse_obs(obs),      # <-- 3. 图像顺着管道流向主进程 
                     "reward": final_reward,
                     "done": final_done,
                     "steps_taken": steps_taken,

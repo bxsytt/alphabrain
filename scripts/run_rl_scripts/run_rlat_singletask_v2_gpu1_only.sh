@@ -1,17 +1,15 @@
 #!/bin/bash
 # ============================================================
-# RLActionToken 单任务训练 v2 — 修复 success_weight + 优化参数
+# RLActionToken 单任务训练 v2 — 仅使用 GPU1（绕过 GPU0）
 #
-# 主要改进：
-#   1. 修复 ReplayBuffer.sample() 支持 success_weight（原来单任务不生效）
-#   2. warmup_iters=20 → 更多纯 VLA 数据填充 buffer
-#   3. bc_pretrain_steps=5000 → 更充分的 BC 预训练
-#   4. utd_ratio=10.0 → 每次迭代 ~90 次 TD 更新（原来是 27）
-#   5. beta=0.5 → 更强的 BC 正则防止 actor 漂移
-#   6. success_weight=5.0 → 成功 transition 过采样率 5×
+# 适用场景：GPU0 掉卡，仅 GPU1 可用
+# 改动：
+#   - CUDA_VISIBLE_DEVICES=1（只暴露 GPU1）
+#   - rollout_gpus 和 train_gpu 都指向 GPU1
+#   - 由于只有一张卡，rollout 和 training 串行执行
 # ============================================================
 
-RUN_NAME="rlt_singletask_task0_v2_$(date +%m%d_%H%M)"
+RUN_NAME="rlt_singletask_task0_v2_gpu1only_$(date +%m%d_%H%M)"
 CKPT_PATH="data/final_run"
 ENCODER_PATH="results/rlt_training_TD3/phase1_pretrain/pretrain/checkpoints/pretrain_best/encoder.pt"
 OUTPUT_DIR="results/action_token_training_TD3/${RUN_NAME}/rl_offpolicy"
@@ -19,17 +17,22 @@ OUTPUT_DIR="results/action_token_training_TD3/${RUN_NAME}/rl_offpolicy"
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate alphabrain
 
-export CUDA_VISIBLE_DEVICES=0,1
+# ★ 关键：只暴露 GPU1，让 CUDA 认为它是唯一的 GPU（cuda:0）
+export CUDA_VISIBLE_DEVICES=1
 export LIBERO_PYTHON=/home/zlb/miniconda3/envs/libero/bin/python
 export PYTHONPATH="${PYTHONPATH}:${PWD}"
 
+# ★ 开启 CUDA_LAUNCH_BLOCKING=1 以便在出错时获得精确的堆栈跟踪
+export CUDA_LAUNCH_BLOCKING=1
+
 echo "============================================================"
-echo " RLActionToken Single-Task Training v2"
+echo " RLActionToken Single-Task Training v2 (GPU1 Only)"
 echo "   run_name:  ${RUN_NAME}"
 echo "   ckpt:      ${CKPT_PATH}"
 echo "   encoder:   ${ENCODER_PATH}"
 echo "   output:    ${OUTPUT_DIR}"
 echo "   suite:     libero_goal | task_id: 0"
+echo "   GPU:       GPU1 only (CUDA_VISIBLE_DEVICES=1)"
 echo "============================================================"
 
 python AlphaBrain/training/reinforcement_learning/trainers/train.py \
@@ -40,7 +43,7 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --suite libero_goal \
     --task_id 0 \
     --use_steplock \
-    --rollout_gpus 1 \
+    --rollout_gpus 0 \
     --train_gpu 0 \
     --bottleneck_dim 256 \
     --encoder_layers 2 \
@@ -58,7 +61,7 @@ python AlphaBrain/training/reinforcement_learning/trainers/train.py \
     --gamma 0.99 \
     --max_grad_norm 1.0 \
     --buffer_capacity 1000000 \
-    --buffer_warmup 51200 \
+    --buffer_warmup 10240 \
     --warmup_iters 20 \
     --bc_pretrain_steps 5000 \
     --td_updates_per_iter 50000 \

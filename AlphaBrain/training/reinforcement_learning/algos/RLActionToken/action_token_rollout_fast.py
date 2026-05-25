@@ -59,7 +59,7 @@ def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_fr
                "wrist_image": np.zeros((256,256,3), dtype=np.uint8),
                "state": np.zeros(8, dtype=np.float32)}
         return obs, 0.0, True, 0, [], []
-    return obs, reward, done, steps_taken, [], sub_obs
+    return obs, reward, done, steps_taken, [], sub_obs      # <-- 4. 这里的 sub_obs 包含了那些画面
 
 
 def _env_dummy_steps(env_pool, env_idx, n_steps):
@@ -71,7 +71,7 @@ def _env_dummy_steps(env_pool, env_idx, n_steps):
 
 """
  这是一个 step-lock（步锁）架构的并行 rollout 采集函数，是 RLActionToken 强化学习系统中核心的性能瓶颈突破点。
- 它在同一 GPU 上并行运行 G 个环境实例，以 lockstep（齐步走） 的方式用 单次 GPU 批处理调用 同时为所有活跃环境推理，
+ 它在同一GPU上并行运行G个环境实例，以lockstep（齐步走）的方式用单次GPU批处理调用，同时为所有活跃环境推理，
  大幅提升 GPU 利用率。
  """
 @torch.no_grad()
@@ -131,7 +131,7 @@ def action_token_collect_group_steplock(
     n_workers = min(G, len(env_pool))
 
     # ── Phase 1: Reset all envs in parallel   使用 G 个线程并行重置所有环境 ──
-    # 多线程并行重置（Parallel Reset）：利用 ThreadPoolExecutor 并行调用env_pool.reset_env，让G个环境同时初始化
+    # 多线程并行重置 ：利用 ThreadPoolExecutor 并行调用env_pool.reset_env，让G个环境同时初始化
     from concurrent.futures import as_completed as _as_completed
     obs_list = [None] * G
     try:
@@ -147,7 +147,7 @@ def action_token_collect_group_steplock(
     task_descriptions = [env_pool.envs[env_offset + g].task_description for g in range(G)]
 
     # ── Phase 2: Warmup dummy steps (parallel) ──
-    # 所有环境并行执行 num_steps_wait 步零动作，让仿真的物理世界（如 MuJoCo 或 Isaac Gym）的刚体碰撞、重力过渡稳定下来
+    # 所有环境并行执行 num_steps_wait 步零动作，让仿真的物理世界（如 MuJoCo）的刚体碰撞、重力过渡稳定下来
     if num_steps_wait > 0:
         with ThreadPoolExecutor(max_workers=G) as _pool:
             _futs = {_pool.submit(_env_dummy_steps, env_pool, env_offset + g, num_steps_wait): g for g in range(G)}
@@ -195,6 +195,7 @@ def action_token_collect_group_steplock(
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
         print(f"  [VLA forward] batch={len(batch_images)}, active_envs={len(active_ids)}", flush=True)
+        # 把所有当前还未结束（Active）的环境的图像、指令打包成一个大 Batch，一次性送入GPU调用 frozen_vla.get_vla_action
         with torch.autocast("cuda", dtype=torch.bfloat16):
             action_queries, vla_actions = frozen_vla.get_vla_action(    # [2,8,2048] [2,8,7]
                 batch_images=batch_images, instructions=batch_instrs)
@@ -278,9 +279,11 @@ def action_token_collect_group_steplock(
         _t_unnormalize += _t1 - _t0
 
         # ── Step 4: All envs execute chunk in parallel ──
+        # 把前面由大模型（VLA）和 RL 策略计算出来的动作块（Action Chunk），分发给多个并行
+        # 的仿真环境去具体执行，并收集执行后的反馈数据
         _t0 = time.time()
         record_video = video_dir is not None
-        # 存储每个 env 的 sub_obs，供后续 sub_tokens 采集
+        # 存放各个环境在动作块执行中途（如第 2、4、6 步）拦截到的“中间状态快照”，用于紧接着的 Step 5（子 Token 采集）
         sub_obs_by_env = {}
         with ThreadPoolExecutor(max_workers=len(active_ids)) as _pool:
             _futs = {}
@@ -289,16 +292,18 @@ def action_token_collect_group_steplock(
                     _env_step_chunk, env_pool, env_offset + g, action_chunks_unnorm[i],
                     exec_chunk_len, record_video, _sub_positions
                 )] = (i, g)
+            # 调用 as_completed 方法遍历所有任务:哪个环境先执行完，它就先吐出哪个环境的凭证 _f
             for _f in _as_completed(_futs):
                 i, g = _futs[_f]
+                # 5. 从多线程的 Promise 中捞出数据，这里的 sub_obs 就是子进程跨进程送过来的
                 obs, reward, done, steps_taken, frames, sub_obs = _f.result()
                 obs_list[g] = obs
                 env_steps[g] += steps_taken
-                sub_obs_by_env[g] = sub_obs
+                sub_obs_by_env[g] = sub_obs        # <-- 6. 按照环境 ID `g` 存入字典
                 if record_video:
                     all_frames[g].extend(frames)
                 if done or env_steps[g] >= max_steps:
-                    active[g] = False
+                    active[g] = False    # 一旦满足结束条件，就把它的活跃状态划掉
                     ep = episodes[g]
                     ep.success = bool(done and reward > 0.5)
                     ep.reward = reward_coef if ep.success else 0.0
@@ -316,17 +321,19 @@ def action_token_collect_group_steplock(
         for g in active_ids:
             sub_list = sub_obs_by_env.get(g, [])
             for sub_idx, sub_o in enumerate(sub_list):
+                # 7. 此时 sub_o 完美继承了子进程中 _parse_obs(obs) 提取出来的那些原始仿真画面
                 flat_sub.append((g, sub_idx, sub_o))
         if flat_sub:
             batch_sub_images = [[o["primary_image"], o["wrist_image"]] for _, _, o in flat_sub]
             batch_sub_instrs = [task_descriptions[g] for g, _, _ in flat_sub]
             with torch.autocast("cuda", dtype=torch.bfloat16):
+                # 所有中间状态的动作查询特征（Action Queries, aq_sub）和原始 VLA 动作（va_sub）
                 aq_sub, va_sub = frozen_vla.get_vla_action(
                     batch_images=batch_sub_images, instructions=batch_sub_instrs)
             rt_sub = encoder.encode(aq_sub)  # (N_sub, 1, D)
             del aq_sub  # 显存优化
             # Distribute back to each env's step_record.sub_tokens
-            for k, (g, sub_idx, sub_o) in enumerate(flat_sub):
+            for k, (g, sub_idx, sub_o) in enumerate(flat_sub):   # 环境 ID g、子序号 sub_idx、原始观测 sub_o）
                 step_record = episodes[g].step_records[-1]  # the record just appended
                 step_record.sub_tokens.append((
                     rt_sub[k:k+1].cpu().squeeze(0),   # rl_token (1, D)

@@ -411,7 +411,20 @@ def extract_action_queries_dataset(
 # ------------------------------------------------------------------
 # Phase 2: RLActionToken Rollout — frozen VLA + encoder + actor
 # ------------------------------------------------------------------
-
+"""
+核心执行流程：
+    1.单环境运行：
+        只负责一个环境（env）的一条轨迹（Episode）采集。
+    2.阻塞式远程推理：
+        当机械臂把上一组动作块执行完（action_cache 耗尽）时，它把当前环境的单张图像和状态打包，
+        调用 batch_server.infer(...)。此时，当前线程会卡住（阻塞），等待后台的推理服务器排队
+        处理并返回结果。
+    3.步进执行：
+        拿到动作块后，在 while 循环里一步一步执行 env.step(env_action)。
+    4.低效的子 Token 采集：
+        当执行到第 2, 4, 6 步时，为了获取中间状态的子 Token，它不得不当场再次发起一次阻塞式的
+          batch_server.infer(...) 远程调用
+"""
 def _action_token_rollout_one(
     env: LiberoEnv,
     batch_server: BatchInferenceServer,
@@ -498,6 +511,9 @@ def _action_token_rollout_one(
 
         # Capture intermediate observations for chunk subsampling (stride=2)
         # cache_idx was just incremented, so its value equals the position AFTER this step
+
+        # _action_token_rollout_one虽然采集了 sub_tokens，但注意：_action_token_rollout_one
+        # 是单环境串行执行，每个子位置都要单独调一次 batch_server.infer()（GPU 推理），效率极低
         if not done and cache_idx in _sub_positions and current_sr is not None:
             sub_img = [obs["primary_image"].copy(), obs["wrist_image"].copy()]
             sub_prop_np = np.array(obs["state"], dtype=np.float32)
